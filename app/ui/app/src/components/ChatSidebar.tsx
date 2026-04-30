@@ -6,7 +6,7 @@ import { getChat } from "@/api";
 import { Link } from "@/components/ui/link";
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 import { ChatsResponse } from "@/gotypes";
-import { CogIcon, RocketLaunchIcon } from "@heroicons/react/24/outline";
+import { CogIcon, RocketLaunchIcon, FolderIcon } from "@heroicons/react/24/outline";
 
 // there's a hidden debug feature to copy a chat's data to the clipboard by
 // holding shift and clicking this many times within this many seconds
@@ -299,6 +299,14 @@ export function ChatSidebar({ currentChatId }: ChatSidebarProps) {
         >
           <RocketLaunchIcon className="h-5 w-5 stroke-current" />
           <span className="truncate">Launch</span>
+        </Link>
+        <Link
+          href="/workspaces"
+          className="flex w-full items-center gap-3 rounded-lg px-2 py-2 text-left text-sm text-neutral-700 hover:bg-neutral-100 dark:hover:bg-neutral-800 dark:text-neutral-100"
+          draggable={false}
+        >
+          <FolderIcon className="h-5 w-5 stroke-current" />
+          <span className="truncate">Workspaces</span>
         </Link>
         {isWindows && (
           <Link
