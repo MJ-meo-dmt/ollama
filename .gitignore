@@ -16,3 +16,10 @@ llama/build
 llama/vendor
 /ollama
 integration/testdata/models/
+
+# generated
+*.gen.ts
+
+# build artifacts
+mlx/*.c
+mlx/*.h
