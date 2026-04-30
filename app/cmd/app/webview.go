@@ -369,7 +369,42 @@ func (w *Webview) Run(path string) unsafe.Pointer {
 			})
 		})
 
+		// WORKSPACES ADDITIONS 
+		var workspaceRoot string
+
 		// Add binding for working directory selection
+		wv.Bind("setWorkspaceRoot", func(path string) map[string]interface{} {
+			cleanPath, err := filepath.Abs(path)
+			if err != nil {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": err.Error(),
+				}
+			}
+
+			info, err := os.Stat(cleanPath)
+			if err != nil {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": err.Error(),
+				}
+			}
+
+			if !info.IsDir() {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "Workspace root must be a directory",
+				}
+			}
+
+			workspaceRoot = cleanPath
+
+			return map[string]interface{}{
+				"ok":   true,
+				"path": workspaceRoot,
+			}
+		})
+
 		wv.Bind("selectWorkingDirectory", func() {
 			go func() {
 				// Helper function to call the JavaScript callback with data or null
@@ -387,8 +422,285 @@ func (w *Webview) Run(path string) unsafe.Pointer {
 					return
 				}
 				slog.Debug("Directory selected", "path", directory)
+				workspaceRoot = directory
 				callCallback(directory)
 			}()
+		})
+
+		wv.Bind("selectWorkspaceDirectory", func() {
+			go func() {
+				callCallback := func(data interface{}) {
+					dataJSON, _ := json.Marshal(data)
+					wv.Dispatch(func() {
+						wv.Eval(fmt.Sprintf("window.__selectWorkspaceDirectoryCallback && window.__selectWorkspaceDirectoryCallback(%s)", dataJSON))
+					})
+				}
+
+				directory, err := dialog.Directory().
+					Title("Select Workspace Directory").
+					ShowHidden(true).
+					Browse()
+
+				if err != nil {
+					slog.Debug("workspace directory selection cancelled or failed", "error", err)
+					callCallback(nil)
+					return
+				}
+
+				cleanDirectory, err := filepath.Abs(directory)
+				if err != nil {
+					slog.Debug("failed to clean workspace directory", "error", err)
+					callCallback(nil)
+					return
+				}
+
+				slog.Debug("workspace directory selected", "path", cleanDirectory)
+				workspaceRoot = cleanDirectory
+				callCallback(cleanDirectory)
+			}()
+		})		
+
+		wv.Bind("readWorkspaceTree", func(root string) map[string]interface{} {
+			if workspaceRoot == "" || root != workspaceRoot {
+				return map[string]interface{}{
+					"ok": false,
+					"error": "Workspace root is not selected",
+				}
+			}
+
+			type WorkspaceFile struct {
+				Name     string          `json:"name"`
+				Path     string          `json:"path"`
+				RelPath  string          `json:"relPath"`
+				Type     string          `json:"type"`
+				Children []WorkspaceFile `json:"children,omitempty"`
+			}
+
+			ignoredDirs := map[string]bool{
+				".git":         true,
+				"node_modules": true,
+				"dist":         true,
+				"build":        true,
+				".next":        true,
+				".venv":        true,
+				"venv":         true,
+				"__pycache__":  true,
+			}
+
+			var walk func(string) (WorkspaceFile, error)
+
+			walk = func(path string) (WorkspaceFile, error) {
+				info, err := os.Stat(path)
+				if err != nil {
+					return WorkspaceFile{}, err
+				}
+
+				ext := strings.ToLower(filepath.Ext(path))
+
+				allowed := map[string]bool{
+					".js": true,
+					".jsx": true,
+					".ts": true,
+					".tsx": true,
+					".py": true,
+					".go": true,
+					".md": true,
+					".json": true,
+					".css": true,
+					".html": true,
+					".yml": true,
+					".yaml": true,
+					".toml": true,
+				}
+
+				if !info.IsDir() && !allowed[ext] {
+					return WorkspaceFile{}, nil
+				}
+
+				relPath, err := filepath.Rel(root, path)
+				if err != nil {
+					relPath = info.Name()
+				}
+
+				if relPath == "." {
+					relPath = ""
+				}
+
+				node := WorkspaceFile{
+					Name:    info.Name(),
+					Path:    path,
+					RelPath: filepath.ToSlash(relPath),
+					Type:    "file",
+				}
+
+				if info.IsDir() {
+					node.Type = "folder"
+
+					entries, err := os.ReadDir(path)
+					if err != nil {
+						return node, nil
+					}
+
+					for _, entry := range entries {
+						if entry.IsDir() && ignoredDirs[entry.Name()] {
+							continue
+						}
+
+						childPath := filepath.Join(path, entry.Name())
+						child, err := walk(childPath)
+						if err != nil {
+							continue
+						}
+
+						if child.Name == "" {
+							continue
+						}
+
+						node.Children = append(node.Children, child)
+					}
+				}
+
+				return node, nil
+			}
+
+			rootInfo, err := os.Stat(root)
+			if err != nil || !rootInfo.IsDir() {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "Invalid workspace directory",
+				}
+			}
+
+			tree, err := walk(root)
+			if err != nil {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": err.Error(),
+				}
+			}
+
+			return map[string]interface{}{
+				"ok":   true,
+				"root": tree,
+			}
+		})
+
+		wv.Bind("readWorkspaceFile", func(path string) map[string]interface{} {
+			cleanRoot, err := filepath.Abs(workspaceRoot)
+			if err != nil || cleanRoot == "" {
+				return map[string]interface{}{
+					"ok": false,
+					"error": "Workspace root is not selected",
+				}
+			}
+
+			cleanPath, err := filepath.Abs(path)
+			if err != nil {
+				return map[string]interface{}{
+					"ok": false,
+					"error": err.Error(),
+				}
+			}
+
+			rel, err := filepath.Rel(cleanRoot, cleanPath)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				return map[string]interface{}{
+					"ok": false,
+					"error": "Blocked file access outside workspace",
+				}
+			}
+
+			info, err := os.Stat(path)
+			if err != nil {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": err.Error(),
+				}
+			}
+
+			if info.IsDir() {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "Cannot read a directory as a file",
+				}
+			}
+
+			const maxFileSize = int64(1024 * 1024) // 1MB for now
+
+			if info.Size() > maxFileSize {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "File too large to preview",
+				}
+			}
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": err.Error(),
+				}
+			}
+
+			return map[string]interface{}{
+				"ok":      true,
+				"path":    path,
+				"content": string(data),
+			}
+		})
+
+		wv.Bind("writeWorkspaceFile", func(path string, content string) map[string]interface{} {
+			cleanRoot, err := filepath.Abs(workspaceRoot)
+			if err != nil || cleanRoot == "" {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "Workspace root is not selected",
+				}
+			}
+
+			cleanPath, err := filepath.Abs(path)
+			if err != nil {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": err.Error(),
+				}
+			}
+
+			rel, err := filepath.Rel(cleanRoot, cleanPath)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "Blocked file write outside workspace",
+				}
+			}
+
+			info, err := os.Stat(cleanPath)
+			if err != nil {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": err.Error(),
+				}
+			}
+
+			if info.IsDir() {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "Cannot write to a directory",
+				}
+			}
+
+			err = os.WriteFile(cleanPath, []byte(content), 0644)
+			if err != nil {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": err.Error(),
+				}
+			}
+
+			return map[string]interface{}{
+				"ok":   true,
+				"path": cleanPath,
+			}
 		})
 
 		wv.Bind("setContextMenuItems", func(items []map[string]interface{}) error {
