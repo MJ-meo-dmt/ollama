@@ -10,8 +10,8 @@ export function WorkspaceEditor({
   error,
 }: WorkspaceEditorProps) {
   return (
-    <section className="h-full overflow-hidden bg-neutral-50 dark:bg-neutral-950">
-      <div className="flex h-11 items-center border-b border-neutral-200 px-4 dark:border-neutral-800">
+    <section className="h-full overflow-hidden bg-neutral-100 dark:bg-neutral-950">
+      <div className="flex h-11 items-center border-b border-neutral-300 bg-neutral-50 px-4 dark:border-neutral-800 dark:bg-neutral-900">
         <span className="truncate text-sm font-medium dark:text-white">
           {selectedFile || "No file selected"}
         </span>
@@ -24,7 +24,7 @@ export function WorkspaceEditor({
           </div>
         )}
 
-        <pre className="whitespace-pre-wrap font-mono text-sm text-neutral-800 dark:text-neutral-200">
+        <pre className="rounded-xl bg-neutral-50 p-4 whitespace-pre-wrap font-mono text-sm text-neutral-800 dark:bg-neutral-900 dark:text-neutral-200">
           {selectedFile ? content : "Open a workspace and select a file."}
         </pre>
       </div>

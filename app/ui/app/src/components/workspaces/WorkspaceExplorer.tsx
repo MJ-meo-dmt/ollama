@@ -50,7 +50,7 @@ function TreeNode({
         className={`block w-full rounded-md px-2 py-1.5 text-left text-sm ${
           isSelected
             ? "bg-neutral-200 text-black dark:bg-neutral-700 dark:text-white"
-            : "text-neutral-700 hover:bg-neutral-100 dark:text-neutral-300 dark:hover:bg-neutral-800"
+            : "text-neutral-700 hover:bg-neutral-200 dark:text-neutral-300 dark:hover:bg-neutral-800"
         }`}
         style={{ paddingLeft: `${8 + depth * 14}px` }}
       >
@@ -85,8 +85,8 @@ export function WorkspaceExplorer({
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
   return (
-    <section className="h-full overflow-hidden border-r border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900">
-      <div className="border-b border-neutral-200 p-3 dark:border-neutral-800">
+    <section className="h-full overflow-hidden border-r border-neutral-300 bg-neutral-100 dark:border-neutral-800 dark:bg-neutral-900">
+      <div className="border-b border-neutral-300 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-900">
         <button
           onClick={onOpenWorkspace}
           className="w-full rounded-lg bg-black px-3 py-2 text-sm text-white dark:bg-white dark:text-black"

@@ -17,7 +17,7 @@ llama/vendor
 /ollama
 integration/testdata/models/
 
-# generated
+# Generated route files
 *.gen.ts
 
 # build artifacts

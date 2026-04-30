@@ -675,17 +675,33 @@ func (w *Webview) Run(path string) unsafe.Pointer {
 			}
 
 			info, err := os.Stat(cleanPath)
-			if err != nil {
+			if err == nil && info.IsDir() {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "Cannot write to a directory",
+				}
+			}
+
+			if err != nil && !os.IsNotExist(err) {
 				return map[string]interface{}{
 					"ok":    false,
 					"error": err.Error(),
 				}
 			}
 
-			if info.IsDir() {
+			parentDir := filepath.Dir(cleanPath)
+			parentInfo, err := os.Stat(parentDir)
+			if err != nil {
 				return map[string]interface{}{
 					"ok":    false,
-					"error": "Cannot write to a directory",
+					"error": "Parent directory does not exist",
+				}
+			}
+
+			if !parentInfo.IsDir() {
+				return map[string]interface{}{
+					"ok":    false,
+					"error": "Parent path is not a directory",
 				}
 			}
 

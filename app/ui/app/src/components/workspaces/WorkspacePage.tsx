@@ -61,7 +61,7 @@ function findGuidance(node: WorkspaceNode): WorkspaceNode[] {
 
   if (
     node.type === "file" &&
-    (name === "start_here.md" || name === "context.md" || name === "rules.md" || name === "AGENTS.md")
+    (name === "start_here.md" || name === "context.md" || name === "rules.md" || name === "agents.md" || name === "style.md")
   ) {
     results.push(node)
   }
@@ -105,6 +105,104 @@ function applySnippetPatch(
     : updatedNormalized
 }
 
+function buildWorkspaceMap(
+  node: WorkspaceNode | null,
+  maxLines = 300,
+): string {
+  if (!node) return ""
+
+  const lines: string[] = []
+
+  function walk(current: WorkspaceNode, depth: number) {
+    if (lines.length >= maxLines) return
+
+    const indent = "  ".repeat(depth)
+    const suffix = current.type === "folder" ? "/" : ""
+
+    // Skip rendering empty root name weirdly
+    const label = current.relPath === "" ? current.name : current.name
+
+    lines.push(`${indent}${label}${suffix}`)
+
+    if (current.type === "folder") {
+      current.children?.forEach((child) => walk(child, depth + 1))
+    }
+  }
+
+  walk(node, 0)
+
+  if (lines.length >= maxLines) {
+    lines.push("...[workspace map trimmed]")
+  }
+
+  return lines.join("\n")
+}
+
+function normalizePath(path: string) {
+  return path.replace(/\\/g, "/").toLowerCase()
+}
+
+function getActiveGuidanceForFile(
+  allGuidanceFiles: WorkspaceNode[],
+  selectedFile: string | null,
+  workspacePath: string | null,
+): WorkspaceNode[] {
+  if (!selectedFile || !workspacePath) {
+    return allGuidanceFiles.filter((file) => {
+      const name = file.name.toLowerCase()
+      return name === "start_here.md" || name === "agents.md" || name === "context.md" || name === "rules.md"
+    })
+  }
+
+  const root = normalizePath(workspacePath)
+  const selected = normalizePath(selectedFile)
+  const selectedRel = selected.startsWith(root)
+    ? selected.slice(root.length).replace(/^\/+/, "")
+    : selected
+
+  const selectedParts = selectedRel.split("/").filter(Boolean)
+  selectedParts.pop() // remove filename
+
+  return allGuidanceFiles.filter((file) => {
+    const fileRel = normalizePath(file.relPath || file.name)
+    const fileName = file.name.toLowerCase()
+
+    const isKnownGuidance =
+      fileName === "start_here.md" ||
+      fileName === "agents.md" ||
+      fileName === "context.md" ||
+      fileName === "rules.md" ||
+      fileName === "styles.md"
+
+    if (!isKnownGuidance) return false
+
+    // Always include root-level guidance
+    if (!fileRel.includes("/")) return true
+
+    const guidanceDir = fileRel.split("/").slice(0, -1).join("/")
+    const selectedDir = selectedParts.join("/")
+
+    // Include guidance files in parent folders of selected file
+    return (
+      selectedDir === guidanceDir ||
+      selectedDir.startsWith(`${guidanceDir}/`)
+    )
+  })
+}
+
+function resolveWorkspacePath(path: string, workspacePath: string | null) {
+  if (!workspacePath) return path
+
+  const looksAbsolute =
+    /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith("/")
+
+  if (looksAbsolute) {
+    return path
+  }
+
+  return `${workspacePath.replace(/[\\/]+$/, "")}/${path.replace(/^[/\\]+/, "")}`
+}
+
 export default function WorkspacePage() {
   const navigate = useNavigate()
   const { settings } = useSettings()
@@ -115,11 +213,14 @@ export default function WorkspacePage() {
 
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceNode | null>(null)
+  const [workspaceMap, setWorkspaceMap] = useState("")
   const [selectedFileContent, setSelectedFileContent] = useState("")
   const [workspaceError, setWorkspaceError] = useState<string | null>(null)
   const [guidanceFiles, setGuidanceFiles] = useState<WorkspaceNode[]>([])
+  const [allGuidanceFiles, setAllGuidanceFiles] = useState<WorkspaceNode[]>([])
 
   const [patchProposal, setPatchProposal] = useState<WorkspacePatchProposal | null>(null)
+  const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null)
 
   const hasRestoredWorkspace = useRef(false)
 
@@ -131,7 +232,9 @@ export default function WorkspacePage() {
     setWorkspaceError(null)
     setSelectedFile(null)
     setSelectedFileContent("")
+    setWorkspaceMap("")
     setGuidanceFiles([])
+    setAllGuidanceFiles([])
     setPatchProposal(null)
 
     const rootResult = await setWorkspaceRoot(path)
@@ -154,7 +257,14 @@ export default function WorkspacePage() {
     }
 
     setWorkspaceTree(treeResponse.root)
-    setGuidanceFiles(findGuidance(treeResponse.root))
+    
+    const detectedGuidance = findGuidance(treeResponse.root)
+
+    setAllGuidanceFiles(detectedGuidance)
+    setGuidanceFiles(
+      getActiveGuidanceForFile(detectedGuidance, null, workspaceRootPath),
+    )
+    setWorkspaceMap(buildWorkspaceMap(treeResponse.root))
 
     saveRecentWorkspace(path)
     setRecentWorkspaces(getRecentWorkspaces())
@@ -172,6 +282,9 @@ export default function WorkspacePage() {
 
   const handleSelectFile = async (path: string) => {
     setSelectedFile(path)
+    setGuidanceFiles(
+      getActiveGuidanceForFile(allGuidanceFiles, path, workspacePath),
+    )
     setWorkspaceError(null)
 
     const fileResponse = await readWorkspaceFile(path)
@@ -186,53 +299,101 @@ export default function WorkspacePage() {
 
   const handleApplyPatch = async () => {
     if (!patchProposal) return
+    console.log("Applying patch proposal", patchProposal)
+    setWorkspaceNotice("Applying patch...")
 
-    const editableFiles = patchProposal.files.filter(
-      (file) => file.action === "edit",
+    setWorkspaceError(null)
+    setWorkspaceNotice("Applying patch...")
+
+    const supportedFiles = patchProposal.files.filter(
+      (file) => file.action === "edit" || file.action === "create",
     )
 
-    if (editableFiles.length === 0) {
-      setWorkspaceError("Only edit patches are supported for now.")
+    if (supportedFiles.length === 0) {
+      setWorkspaceError("Only edit and create patches are supported for now.")
       return
     }
 
-    for (const patchFile of editableFiles) {
-      const current = await readWorkspaceFile(patchFile.path)
+    for (const patchFile of supportedFiles) {
+      const targetPath = resolveWorkspacePath(patchFile.path, workspacePath)
+      if (patchFile.action === "create") {
+        const existing = await readWorkspaceFile(targetPath)
+
+        if (existing.ok) {
+          setWorkspaceError(`File already exists: ${targetPath}`)
+          return
+        }
+
+        const isMissingFile =
+          existing.error?.toLowerCase().includes("cannot find the file") ||
+          existing.error?.toLowerCase().includes("no such file") ||
+          existing.error?.toLowerCase().includes("not found")
+
+        if (!isMissingFile) {
+          setWorkspaceError(existing.error || `Could not check ${targetPath}`)
+          return
+        }
+
+        const writeResult = await writeWorkspaceFile(
+          targetPath,
+          patchFile.replacement_snippet,
+        )
+
+        if (!writeResult.ok) {
+          setWorkspaceError(writeResult.error || `Failed to create ${targetPath}`)
+          return
+        }
+
+        continue
+      }
+      const current = await readWorkspaceFile(targetPath)
 
       if (!current.ok || current.content === undefined) {
-        setWorkspaceError(current.error || `Failed to read ${patchFile.path}`)
+        setWorkspaceError(current.error || `Failed to read ${targetPath}`)
         return
       }
 
       const updatedContent = applySnippetPatch(
-      current.content,
-      patchFile.original_snippet,
-      patchFile.replacement_snippet,
-    )
+        current.content,
+        patchFile.original_snippet,
+        patchFile.replacement_snippet,
+      )
 
-    if (!updatedContent) {
+    if (updatedContent === null) {
       setWorkspaceError(
-        `Original snippet not found in ${patchFile.path}. Patch was not applied.`,
+        `Original snippet not found in ${targetPath}. Patch was not applied.`,
       )
       return
     }
 
       const writeResult = await writeWorkspaceFile(
-        patchFile.path,
+        targetPath,
         updatedContent,
       )
 
       if (!writeResult.ok) {
-        setWorkspaceError(writeResult.error || `Failed to write ${patchFile.path}`)
+        setWorkspaceError(writeResult.error || `Failed to write ${targetPath}`)
         return
       }
 
-      if (selectedFile === patchFile.path) {
+      if (selectedFile === targetPath) {
         setSelectedFileContent(updatedContent)
       }
     }
 
+    if (selectedFile) {
+      const refreshed = await readWorkspaceFile(selectedFile)
+
+      if (refreshed.ok) {
+        setSelectedFileContent(refreshed.content || "")
+      }
+    }
+
+    await reloadWorkspaceTree()
+
     setPatchProposal(null)
+    setWorkspaceNotice("Patch applied successfully.")
+    setTimeout(() => setWorkspaceNotice(null), 2500)
   }
 
   const startLeftResize = (event: React.MouseEvent<HTMLDivElement>) => {
@@ -269,6 +430,27 @@ export default function WorkspacePage() {
 
     window.addEventListener("mousemove", onMouseMove)
     window.addEventListener("mouseup", onMouseUp)
+  }
+
+  const reloadWorkspaceTree = async () => {
+    if (!workspacePath) return
+
+    const treeResponse = await readWorkspaceTree(workspacePath)
+
+    if (!treeResponse.ok || !treeResponse.root) {
+      setWorkspaceError(treeResponse.error || "Failed to reload workspace")
+      return
+    }
+
+    setWorkspaceTree(treeResponse.root)
+
+    const detectedGuidance = findGuidance(treeResponse.root)
+
+    setAllGuidanceFiles(detectedGuidance)
+    setGuidanceFiles(
+      getActiveGuidanceForFile(detectedGuidance, selectedFile, workspacePath),
+    )
+    setWorkspaceMap(buildWorkspaceMap(treeResponse.root))
   }
 
   useEffect(() => {
@@ -348,10 +530,10 @@ useEffect(() => {
           </h1>
 
           <div className="mr-4 flex max-w-[60%] items-center gap-2 overflow-hidden">
-            <span className="text-xs text-neutral-500">Guidance:</span>
+            <span className="text-xs text-neutral-500">Active guidance chain:</span>
 
             {guidanceFiles.length === 0 ? (
-              <span className="text-xs text-neutral-400">none detected</span>
+              <span className="text-xs text-neutral-400">none active</span>
             ) : (
               guidanceFiles.map((file) => (
                 <button
@@ -366,7 +548,17 @@ useEffect(() => {
             )}
           </div>
         </header>
+          {workspaceNotice && (
+            <div className="border-b border-green-200 bg-green-50 px-4 py-2 text-sm text-green-700 dark:border-green-900/50 dark:bg-green-900/20 dark:text-green-300">
+              {workspaceNotice}
+            </div>
+          )}
 
+          {workspaceError && (
+            <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-300">
+              {workspaceError}
+            </div>
+          )}
         <div
           className="flex-1 grid overflow-hidden"
           style={{
@@ -413,6 +605,7 @@ useEffect(() => {
 
           <WorkspaceChat
             workspacePath={workspacePath}
+            workspaceMap={workspaceMap}
             selectedFile={selectedFile}
             selectedFileContent={selectedFileContent}
             guidanceFiles={guidanceFiles}

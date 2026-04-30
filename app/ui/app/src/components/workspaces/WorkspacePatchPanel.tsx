@@ -12,7 +12,7 @@ export function WorkspacePatchPanel({
   onApply
 }: WorkspacePatchPanelProps) {
   return (
-    <section className="border-t border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+    <section className="border-t border-neutral-300 bg-neutral-100 p-4 dark:border-neutral-800 dark:bg-neutral-900">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="font-medium dark:text-white">Patch Proposal</h2>
@@ -31,7 +31,7 @@ export function WorkspacePatchPanel({
         {proposal.files.map((file, index) => (
           <div
             key={`${file.path}-${index}`}
-            className="rounded-xl border border-neutral-200 dark:border-neutral-800"
+            className="rounded-xl border border-neutral-300 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-900"
           >
             <div className="border-b border-neutral-200 p-3 dark:border-neutral-800">
               <div className="font-mono text-sm dark:text-white">
@@ -73,10 +73,16 @@ export function WorkspacePatchPanel({
       )}
 
     <button
-        onClick={onApply}
-        className="mt-4 w-full rounded-lg bg-black px-3 py-2 text-sm text-white dark:bg-white dark:text-black"
-        >
-        Apply edit patch
+      type="button"
+      onClick={(event) => {
+        event.preventDefault()
+        event.stopPropagation()
+        console.log("Patch apply button clicked")
+        onApply()
+      }}
+      className="mt-4 w-full rounded-lg bg-black px-3 py-2 text-sm text-white dark:bg-white dark:text-black"
+    >
+      Apply patch
     </button>
     </section>
   )
