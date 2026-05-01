@@ -12,6 +12,8 @@ import { useSettings } from "@/hooks/useSettings"
 import type { WorkspacePatchProposal } from "./patchTypes"
 import { WorkspacePatchPanel } from "./WorkspacePatchPanel"
 import { writeWorkspaceFile } from "./workspaceApi"
+import { applyPatchMatch } from "./patchMatcher"
+import type { PatchMatchResult } from "./patchMatcher"
 
 import type { WorkspaceNode } from "@/types/workspace-webview"
 import {
@@ -71,167 +73,6 @@ function findGuidance(node: WorkspaceNode): WorkspaceNode[] {
   })
 
   return results
-}
-
-type PatchAnchors = {
-  before?: string
-  after?: string
-}
-
-function normalizeLineEndings(value: string) {
-  return value.replace(/\r\n/g, "\n")
-}
-
-function normalizeLoose(value: string) {
-  return normalizeLineEndings(value)
-    .split("\n")
-    .map((line) => line.trimEnd())
-    .join("\n")
-    .trim()
-}
-
-function preserveLineEndings(original: string, updated: string) {
-  return original.includes("\r\n") ? updated.replace(/\n/g, "\r\n") : updated
-}
-
-function findLooseMatchRange(content: string, snippet: string) {
-  const contentLines = normalizeLineEndings(content).split("\n")
-  const snippetLines = normalizeLineEndings(snippet).split("\n")
-
-  const normalizedSnippet = normalizeLoose(snippet)
-
-  for (let start = 0; start < contentLines.length; start++) {
-    for (
-      let end = start + 1;
-      end <= Math.min(contentLines.length, start + snippetLines.length + 4);
-      end++
-    ) {
-      const candidate = contentLines.slice(start, end).join("\n")
-
-      if (normalizeLoose(candidate) === normalizedSnippet) {
-        return { start, end }
-      }
-    }
-  }
-
-  return null
-}
-
-function applyAnchorPatch(
-  currentContent: string,
-  replacementSnippet: string,
-  anchors?: PatchAnchors,
-): string | null {
-  if (!anchors?.before && !anchors?.after) {
-    return null
-  }
-
-  const normalizedCurrent = normalizeLineEndings(currentContent)
-  const lines = normalizedCurrent.split("\n")
-
-  const before = anchors.before ? normalizeLoose(anchors.before) : null
-  const after = anchors.after ? normalizeLoose(anchors.after) : null
-
-  let beforeEnd = 0
-  let afterStart = lines.length
-
-  if (before) {
-    let found = false
-
-    for (let start = 0; start < lines.length; start++) {
-      for (let end = start + 1; end <= Math.min(lines.length, start + 12); end++) {
-        const candidate = lines.slice(start, end).join("\n")
-
-        if (normalizeLoose(candidate) === before) {
-          beforeEnd = end
-          found = true
-          break
-        }
-      }
-
-      if (found) break
-    }
-
-    if (!found) return null
-  }
-
-  if (after) {
-    let found = false
-
-    for (let start = beforeEnd; start < lines.length; start++) {
-      for (let end = start + 1; end <= Math.min(lines.length, start + 12); end++) {
-        const candidate = lines.slice(start, end).join("\n")
-
-        if (normalizeLoose(candidate) === after) {
-          afterStart = start
-          found = true
-          break
-        }
-      }
-
-      if (found) break
-    }
-
-    if (!found) return null
-  }
-
-  if (beforeEnd > afterStart) {
-    return null
-  }
-
-  const updatedLines = [
-    ...lines.slice(0, beforeEnd),
-    replacementSnippet,
-    ...lines.slice(afterStart),
-  ]
-
-  return preserveLineEndings(currentContent, updatedLines.join("\n"))
-}
-
-function applySnippetPatch(
-  currentContent: string,
-  originalSnippet: string,
-  replacementSnippet: string,
-  anchors?: PatchAnchors,
-): string | null {
-  // 1. Exact match first.
-  if (originalSnippet && currentContent.includes(originalSnippet)) {
-    return currentContent.replace(originalSnippet, replacementSnippet)
-  }
-
-  // 2. Normalized line-ending exact match.
-  const normalizedCurrent = normalizeLineEndings(currentContent)
-  const normalizedOriginal = normalizeLineEndings(originalSnippet)
-  const normalizedReplacement = normalizeLineEndings(replacementSnippet)
-
-  if (originalSnippet && normalizedCurrent.includes(normalizedOriginal)) {
-    const updated = normalizedCurrent.replace(
-      normalizedOriginal,
-      normalizedReplacement,
-    )
-
-    return preserveLineEndings(currentContent, updated)
-  }
-
-  // 3. Loose whitespace match.
-  if (originalSnippet) {
-    const range = findLooseMatchRange(currentContent, originalSnippet)
-
-    if (range) {
-      const lines = normalizeLineEndings(currentContent).split("\n")
-
-      const updatedLines = [
-        ...lines.slice(0, range.start),
-        normalizedReplacement,
-        ...lines.slice(range.end),
-      ]
-
-      return preserveLineEndings(currentContent, updatedLines.join("\n"))
-    }
-  }
-
-  // 4. Anchor-based fallback.
-  return applyAnchorPatch(currentContent, normalizedReplacement, anchors)
 }
 
 function normalizeWorkspacePath(path: string) {
@@ -355,7 +196,9 @@ export default function WorkspacePage() {
   const [allGuidanceFiles, setAllGuidanceFiles] = useState<WorkspaceNode[]>([])
 
   const [patchProposal, setPatchProposal] = useState<WorkspacePatchProposal | null>(null)
+  const [patchMatchResults, setPatchMatchResults] = useState<Record<string, PatchMatchResult>>({})
   const [workspaceNotice, setWorkspaceNotice] = useState<string | null>(null)
+  const [contextRevision, setContextRevision] = useState(0)
 
   const hasRestoredWorkspace = useRef(false)
 
@@ -371,6 +214,7 @@ export default function WorkspacePage() {
     setGuidanceFiles([])
     setAllGuidanceFiles([])
     setPatchProposal(null)
+    setPatchMatchResults({})
 
     const rootResult = await setWorkspaceRoot(path)
 
@@ -432,6 +276,52 @@ export default function WorkspacePage() {
     setSelectedFileContent(fileResponse.content || "")
   }
 
+  const buildPatchMatchResults = async (
+    proposal: WorkspacePatchProposal,
+  ): Promise<Record<string, PatchMatchResult>> => {
+    const results: Record<string, PatchMatchResult> = {}
+
+    for (const patchFile of proposal.files) {
+      if (patchFile.action === "create") {
+        continue
+      }
+
+      const safeRelPath = normalizeWorkspacePath(patchFile.path)
+      const targetPath = resolveWorkspacePath(safeRelPath, workspacePath)
+
+      const current = await readWorkspaceFile(targetPath)
+
+      if (!current.ok || current.content === undefined) {
+        results[patchFile.path] = {
+          ok: false,
+          method: "failed",
+          confidence: 0,
+          reason: current.error || `Failed to read ${targetPath}`,
+        }
+        continue
+      }
+
+      results[patchFile.path] = applyPatchMatch({
+        currentContent: current.content,
+        originalSnippet: patchFile.original_snippet,
+        replacementSnippet: patchFile.replacement_snippet,
+        anchors: patchFile.anchors,
+        minConfidence: 0.65,
+      })
+    }
+
+    return results
+  }
+
+  const handlePatchProposal = async (proposal: WorkspacePatchProposal) => {
+    setPatchProposal(proposal)
+    setPatchMatchResults({})
+
+    const matches = await buildPatchMatchResults(proposal)
+
+    setPatchMatchResults(matches)
+  }
+
   const handleApplyPatch = async () => {
     if (!patchProposal) return
     console.log("Applying patch proposal", patchProposal)
@@ -451,6 +341,8 @@ export default function WorkspacePage() {
       setWorkspaceError("Only edit and create patches are supported for now.")
       return
     }
+
+    const nextPatchMatchResults: Record<string, PatchMatchResult> = {}
 
     for (const patchFile of supportedFiles) {
       const safeRelPath = normalizeWorkspacePath(patchFile.path)
@@ -497,22 +389,36 @@ export default function WorkspacePage() {
       console.log("Replacement snippet:", patchFile.replacement_snippet)
       console.log("Current content:", current.content)
 
-      const updatedContent = applySnippetPatch(
-        current.content,
-        patchFile.original_snippet,
-        patchFile.replacement_snippet,
-        patchFile.anchors,
-      )
+      const matchResult = applyPatchMatch({
+        currentContent: current.content,
+        originalSnippet: patchFile.original_snippet,
+        replacementSnippet: patchFile.replacement_snippet,
+        anchors: patchFile.anchors,
+        minConfidence: 0.65,
+      })
 
-    if (updatedContent === null) {
-      setWorkspaceError(
-        `Original snippet not found in ${targetPath}. Patch was not applied. The model likely produced a snippet that does not match the current file exactly.`,
-      )
-      return
-    }
+      nextPatchMatchResults[patchFile.path] = matchResult
+      setPatchMatchResults({ ...nextPatchMatchResults })
+
+      console.log("Patch match result", {
+        path: targetPath,
+        method: matchResult.method,
+        confidence: matchResult.confidence,
+        startLine: matchResult.startLine,
+        endLine: matchResult.endLine,
+        reason: matchResult.reason,
+      })
+
+      if (!matchResult.ok || matchResult.content === undefined) {
+        setWorkspaceError(
+          `Patch match failed in ${targetPath}. ${matchResult.reason || "No safe match found."}`,
+        )
+        return
+      }
+
       const writeResult = await writeWorkspaceFile(
         targetPath,
-        updatedContent,
+        matchResult.content,
       )
 
       if (!writeResult.ok) {
@@ -521,7 +427,7 @@ export default function WorkspacePage() {
       }
 
       if (selectedFile === targetPath) {
-        setSelectedFileContent(updatedContent)
+        setSelectedFileContent(matchResult.content)
       }
     }
 
@@ -537,6 +443,8 @@ export default function WorkspacePage() {
 
     setPatchProposal(null)
     setWorkspaceNotice("Patch applied successfully.")
+    setPatchMatchResults({})
+    setContextRevision((prev) => prev + 1)
     setTimeout(() => setWorkspaceNotice(null), 2500)
   }
 
@@ -762,7 +670,11 @@ useEffect(() => {
               >
                 <WorkspacePatchPanel
                   proposal={patchProposal}
-                  onClear={() => setPatchProposal(null)}
+                  matchResults={patchMatchResults}
+                  onClear={() => {
+                    setPatchProposal(null)
+                    setPatchMatchResults({})
+                  }}
                   onApply={handleApplyPatch}
                 />
               </div>
@@ -781,7 +693,8 @@ useEffect(() => {
             selectedFile={selectedFile}
             selectedFileContent={selectedFileContent}
             guidanceFiles={guidanceFiles}
-            onPatchProposal={setPatchProposal}
+            contextRevision={contextRevision}
+            onPatchProposal={handlePatchProposal}
           />
         </div>
       </main>

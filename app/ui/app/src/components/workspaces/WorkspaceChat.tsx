@@ -41,6 +41,7 @@ type WorkspaceChatProps = {
   selectedFile: string | null
   selectedFileContent: string
   guidanceFiles: WorkspaceNode[]
+  contextRevision?: number
   onPatchProposal?: (proposal: WorkspacePatchProposal) => void
 }
 
@@ -254,6 +255,7 @@ export function WorkspaceChat({
   selectedFile,
   selectedFileContent,
   guidanceFiles,
+  contextRevision = 0,
   onPatchProposal,
 }: WorkspaceChatProps) {
   const [message, setMessage] = useState("")
@@ -318,6 +320,10 @@ export function WorkspaceChat({
     setCommandMenuOpen(false)
     textareaRef.current?.focus()
   }
+
+  useEffect(() => {
+    contextManagerRef.current.clearTaskContext()
+  }, [contextRevision])
 
   useEffect(() => {
     localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages))
@@ -536,6 +542,14 @@ export function WorkspaceChat({
       const commandRules =
         parsed.command === "patch"
           ? `PATCH MODE RULES:
+          - Preserve exact identifiers from the user request.
+  - If the user asks to add "key=value", the replacement must include that exact "key=value".
+  - Do not rename similar keys unless the user explicitly asks.
+  - Adding a new entry means append/insert the new line, not replace an existing similar line.
+  - Do not use anchors to replace a block unless original_snippet is empty.
+  - Preserve blank lines from the loaded file when copying original_snippet.
+  - If original_snippet is provided, it must match the current loaded file.
+  - For cleanup tasks like deduplication, replace the full affected file section, not a small partial region.
   - For create actions, do not request or read the target file first.
   - If the task is to create a new file, return a create patch immediately.
   - Paths must be relative to workspace root (no leading /)

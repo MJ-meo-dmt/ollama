@@ -28,7 +28,7 @@ function TreeNode({
   setExpanded,
   depth = 0,
 }: TreeNodeProps) {
-  const isFile = node.type === "file"
+  //const isFile = node.type === "file"
   const isFolder = node.type === "folder"
   const isSelected = selectedFile === node.path
   const isExpanded = expanded[node.path] ?? depth === 0
