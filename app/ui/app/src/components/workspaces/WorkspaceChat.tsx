@@ -605,6 +605,16 @@ export function WorkspaceChat({
   - No tool references
   `
           : `ASK MODE RULES:
+  - Respond in normal readable text (NOT JSON).
+  - Do not wrap your answer in JSON.
+  - Do not return objects like { "type": "answer" }.
+  - Explain clearly using plain text or markdown.
+  - If the user asks to read a file:
+    → request it as context first (JSON)
+    → AFTER it is loaded → respond in text
+  - Use workspace guidance first.
+  - Do not claim files were edited.
+${contextRequestRules}
   - Never invent file contents. If the requested file is not in LOADED CONTEXT, request context instead of answering.
   - If the requested file is already loaded, answer directly from it without mentioning internal context mechanics.
   - If the requested file is not loaded, request it as context first.
