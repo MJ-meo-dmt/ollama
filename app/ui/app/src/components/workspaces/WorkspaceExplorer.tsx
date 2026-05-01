@@ -1,3 +1,5 @@
+// src/components/workspaces/WorkspaceExplorer.tsx
+
 import { useState } from "react"
 import type { WorkspaceNode } from "@/types/workspace-webview"
 

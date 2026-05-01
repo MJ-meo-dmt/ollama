@@ -1,15 +1,14 @@
+// src/components/workspaces/WorkspaceChat.tsx
+
 import { useEffect, useRef, useState } from "react"
 import StreamingMarkdownContent from "@/components/StreamingMarkdownContent"
 import ollama from "ollama/browser"
 import type { WorkspaceNode } from "@/types/workspace-webview"
-import { readWorkspaceFile } from "./workspaceApi"
 import type { WorkspacePatchProposal } from "./patchTypes"
 import { ModelPicker } from "@/components/ModelPicker"
 import { useSelectedModel } from "@/hooks/useSelectedModel"
+import { ContextManager } from "./contextManager"
 
-const GUIDANCE_MAX_CHARS = 12000
-const SELECTED_FILE_MAX_CHARS = 30000
-const EXTRA_FILE_MAX_CHARS = 20000
 const MAX_CONTEXT_AUTO_ROUNDS = 2
 const CHAT_STORAGE_KEY = "workspace_chat_messages"
 
@@ -20,16 +19,18 @@ const WORKSPACE_COMMANDS = [
   { name: "@patch", description: "Propose editable patch" },
 ]
 
+const PATCH_BUSY_MESSAGES = [
+  "Preparing patch proposal",
+  "Checking loaded context",
+  "Drafting safe changes",
+  "Validating patch shape",
+]
+
 type ContextRequest = {
   type: "context_request" | "read_file"
   reason?: string
   files?: string[]
   path?: string
-}
-
-type LoadedContextFile = {
-  path: string
-  content: string
 }
 
 type WorkspaceChatProps = {
@@ -98,29 +99,6 @@ function isContextRequest(value: unknown): value is ContextRequest {
   )
 }
 
-function trimText(value: string, maxChars: number) {
-  if (value.length <= maxChars) {
-    return value
-  }
-
-  return `${value.slice(0, maxChars)}
-
-...[trimmed ${value.length - maxChars} chars]`
-}
-
-function formatContextFile(
-  label: string,
-  content: string,
-  maxChars: number,
-) {
-  const isTrimmed = content.length > maxChars
-
-  return `--- ${label} ---
-STATUS: ${isTrimmed ? `PARTIAL, showing first ${maxChars} of ${content.length} chars` : "FULL"}
-CONTENT:
-${trimText(content, maxChars)}`
-}
-
 function parseWorkspaceCommand(input: string): {
   command: WorkspaceCommand
   task: string
@@ -151,6 +129,71 @@ function parseWorkspaceCommand(input: string): {
   return { command: "ask", task: trimmed }
 }
 
+function getModelContextLength(modelName?: string) {
+  const name = (modelName || "").toLowerCase()
+
+  if (name.includes("qwen3.5") || name.includes("qwen3.6")) return 32768
+  if (name.includes("granite")) return 128000
+  if (name.includes("mistral") || name.includes("ministral")) return 32768
+  if (name.includes("llama")) return 32768
+
+  return 32768
+}
+
+function getBaseName(path: string) {
+  return path.replace(/\\/g, "/").split("/").pop() || path
+}
+
+function taskMentionsAnotherFile(task: string, selectedFile: string | null) {
+  if (!selectedFile) return false
+
+  const selectedBaseName = getBaseName(selectedFile).toLowerCase()
+  const taskLower = task.toLowerCase()
+
+  const mentionedFiles: string[] =
+    taskLower.match(/[\w.-]+\.(ts|tsx|js|jsx|md|json|css|html|go|py|rs)/g) ?? []
+
+  if (mentionedFiles.length === 0) return false
+
+  return !mentionedFiles.some((file) => file === selectedBaseName)
+}
+
+function getMentionedFileNames(task: string) {
+  return (
+    task
+      .toLowerCase()
+      .match(/[\w.-]+\.(ts|tsx|js|jsx|md|json|css|html|go|py|rs)/g) ?? []
+  )
+}
+
+function findMentionedFileInWorkspaceMap(
+  fileName: string,
+  workspaceMap: string,
+  workspacePath: string | null,
+) {
+  if (!workspacePath) return null
+
+  const target = fileName.toLowerCase()
+  const stack: string[] = []
+
+  for (const line of workspaceMap.split(/\r?\n/)) {
+    if (!line.trim() || line.includes("[workspace map trimmed]")) continue
+
+    const depth = Math.floor((line.match(/^ */)?.[0].length || 0) / 2)
+    const cleanName = line.trim().replace(/\/$/, "")
+
+    stack[depth] = cleanName
+    stack.length = depth + 1
+
+    if (cleanName.toLowerCase() === target) {
+      const relPath = stack.slice(1).join("/")
+      return `${workspacePath.replace(/[\\/]+$/, "")}/${relPath}`
+    }
+  }
+
+  return null
+}
+
 export function WorkspaceChat({
   workspacePath,
   workspaceMap,
@@ -167,6 +210,18 @@ export function WorkspaceChat({
       return []
     }
   })
+
+  const contextManagerRef = useRef(new ContextManager())
+
+  const [contextStats, setContextStats] = useState({
+    modelContextLength: 32768,
+    reservedForResponse: 3000,
+    availableForContext: 29768,
+    usedTokens: 0,
+    remainingTokens: 29768,
+    percentUsed: 0,
+  })
+
   const [isRunning, setIsRunning] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -177,6 +232,8 @@ export function WorkspaceChat({
 
   const [commandMenuOpen, setCommandMenuOpen] = useState(false)
   const [commandIndex, setCommandIndex] = useState(0)
+
+  const [patchBusyIndex, setPatchBusyIndex] = useState(0)
 
   const selectCommand = (command: string) => {
     setMessage(`${command} `)
@@ -198,9 +255,21 @@ export function WorkspaceChat({
     }
   }, [isRunning])
 
+  useEffect(() => {
+    if (!isRunning) {
+      setPatchBusyIndex(0)
+      return
+    }
+
+    const interval = window.setInterval(() => {
+      setPatchBusyIndex((prev) => (prev + 1) % PATCH_BUSY_MESSAGES.length)
+    }, 1200)
+
+    return () => window.clearInterval(interval)
+  }, [isRunning])
+
   const handleSend = async () => {
     const userMessage = message.trim()
-    let extraContextFiles: LoadedContextFile[] = []
 
     if (!userMessage || isRunning) {
       return
@@ -208,7 +277,13 @@ export function WorkspaceChat({
 
     const parsed = parseWorkspaceCommand(userMessage)
 
+    const modelContextLength = getModelContextLength(selectedModel?.model)
+    const contextManager = contextManagerRef.current
+
     if (parsed.command === "context") {
+      const stats = contextManager.getStats(modelContextLength)
+      const loadedFiles = contextManager.getLoadedFiles()
+
       setMessage("")
 
       setMessages((prev) => [
@@ -223,19 +298,24 @@ export function WorkspaceChat({
 
     **Workspace:** ${workspacePath || "none"}
 
-    **Selected file:** ${selectedFile || "none"}
+    **Model context length:** ${stats.modelContextLength.toLocaleString()} tokens
 
-    **Selected file status:** ${
-            selectedFile
-              ? selectedFileContent.length > SELECTED_FILE_MAX_CHARS
-                ? `PARTIAL (${SELECTED_FILE_MAX_CHARS} of ${selectedFileContent.length} chars)`
-                : `FULL (${selectedFileContent.length} chars)`
-              : "none"
-          }
+    **Approx context used:** ${stats.usedTokens.toLocaleString()} / ${stats.availableForContext.toLocaleString()} tokens
 
-    **Active guidance files:** ${guidanceFiles.length}
+    **Remaining:** ${stats.remainingTokens.toLocaleString()} tokens
 
-    ${guidanceFiles.map((file) => `- ${file.relPath || file.name}`).join("\n") || "- none"}
+    **Loaded files:**
+
+    ${
+      loadedFiles.length
+        ? loadedFiles
+            .map(
+              (file) =>
+                `- ${file.relPath || file.path} — ${file.mode}, ~${file.tokensEstimate} tokens, priority ${file.priority}`,
+            )
+            .join("\n")
+        : "- none"
+    }
 
     **Workspace map:** ${workspaceMap ? "loaded" : "not loaded"}`,
         },
@@ -243,6 +323,55 @@ export function WorkspaceChat({
 
       return
     }
+
+    contextManager.resetTurn()
+    contextManager.clearTaskContext()
+
+    const mentionedFiles = getMentionedFileNames(parsed.task)
+
+    let focusedFileFromTask: string | null = null
+
+    for (const fileName of mentionedFiles) {
+      const resolved = findMentionedFileInWorkspaceMap(
+        fileName,
+        workspaceMap,
+        workspacePath,
+      )
+
+      if (resolved) {
+        focusedFileFromTask = resolved
+
+        await contextManager.loadFile({
+          path: resolved,
+          workspacePath,
+          source: "requested",
+          task: parsed.task,
+          priority: 98,
+        })
+      }
+    }
+
+    if (
+      selectedFile &&
+      !focusedFileFromTask &&
+      !taskMentionsAnotherFile(parsed.task, selectedFile)
+    ) {
+      contextManager.registerSelectedFile({
+        path: selectedFile,
+        content: selectedFileContent,
+        workspacePath,
+        task: parsed.task,
+      })
+    }
+
+    await contextManager.loadGuidanceFiles({
+      files: guidanceFiles,
+      workspacePath,
+      task: parsed.task,
+      selectedFile: focusedFileFromTask || selectedFile,
+    })
+
+    setContextStats(contextManager.getStats(modelContextLength))
 
     setIsRunning(true)
     setError(null)
@@ -257,19 +386,6 @@ export function WorkspaceChat({
     ])
 
     try {
-      const guidanceContents = await Promise.all(
-        guidanceFiles.slice(0, 8).map(async (file) => {
-          const result = await readWorkspaceFile(file.path)
-
-          return {
-            relPath: file.relPath || file.name,
-            content: result.ok
-              ? result.content || ""
-              : `[failed to read: ${result.error}]`,
-          }
-        }),
-      )
-
       const chatHistory = messages
         .slice(-6)
         .map((item) => `${item.role.toUpperCase()}:\n${item.content}`)
@@ -296,7 +412,11 @@ export function WorkspaceChat({
   - Do not include markdown fences.
   - Do not explain outside the JSON.
   ${contextRequestRules}
-  - If required context is missing, request context first instead of guessing.
+  - If required context is missing, request context first.
+  - After context is loaded, you MUST return a patch_proposal JSON object.
+  - For create actions, use original_snippet as an empty string.
+  - For edit actions, original_snippet must be copied exactly from loaded context.
+  - Never answer with prose in patch mode.
   - Use this shape when enough context is loaded:
   {
     "type": "patch_proposal",
@@ -322,85 +442,43 @@ export function WorkspaceChat({
   - Mention which files should be inspected or changed.
   ${contextRequestRules}`
           : `ASK MODE RULES:
-  - If the user asks to read a file, request it as context first, then after it is loaded, show or summarize the file content.
+  - If the requested file is already loaded, answer directly from it without mentioning internal context mechanics.
+  - If the requested file is not loaded, request it as context first.
   - Explain clearly.
   - Use workspace guidance first.
+  - If a requested file failed to load, say that clearly and do not explain it from guesses.
   - Do not claim files were edited.
   - If code changes are needed, suggest them but do not apply them.
   ${contextRequestRules}`
 
-      const buildPrompt = (extraFiles: LoadedContextFile[]) => `You are the Ollama Workspace Agent.
+      const buildPrompt = () => `You are the Ollama Workspace Agent.
 
-  You are working inside a local workspace.
+        You are working inside a local workspace.
 
-  WORKSPACE ROOT:
-  ${workspacePath || "No workspace selected"}
+        WORKSPACE ROOT:
+        ${workspacePath || "No workspace selected"}
 
-  WORKSPACE MAP:
-  ${workspaceMap || "No workspace map available."}
+        WORKSPACE MAP:
+        ${workspaceMap || "No workspace map available."}
 
-  ACTIVE GUIDANCE FILES:
-  ${
-    guidanceContents
-      .map((file) =>
-        formatContextFile(
-          file.relPath,
-          file.content,
-          GUIDANCE_MAX_CHARS,
-        ),
-      )
-      .join("\n\n") || "No guidance files detected."
-  }
+        LOADED CONTEXT:
+        ${contextManager.buildPromptContext(modelContextLength)}
 
-  SELECTED FILE:
-  ${selectedFile || "No file selected"}
+        CONTEXT BUDGET:
+        ${JSON.stringify(contextManager.getStats(modelContextLength), null, 2)}
 
-  ${
-    selectedFile
-      ? formatContextFile(
-          selectedFile,
-          selectedFileContent,
-          SELECTED_FILE_MAX_CHARS,
-        )
-      : "SELECTED FILE CONTENT:\nNo file selected."
-  }
+        RECENT CHAT HISTORY:
+        ${chatHistory || "No previous chat history."}
 
-  EXTRA CONTEXT FILES:
-  ${
-    extraFiles.length
-      ? extraFiles
-          .map((file) =>
-    formatContextFile(file.path, file.content, EXTRA_FILE_MAX_CHARS),
-  )
-          .join("\n\n")
-      : "No extra context loaded."
-  }
+        COMMAND:
+        @${parsed.command}
 
-  AUTO CONTEXT STATE:
-  ${
-    extraFiles.length > 0
-      ? "Extra context has already been loaded. Continue the user's task using the loaded context. Do not request the same file again."
-      : "No auto-loaded context yet."
-  }
+        USER TASK:
+        ${parsed.task}
 
-  CONTEXT SUMMARY:
-  - Active guidance files: ${guidanceContents.length}
-  - Selected file loaded: ${selectedFile ? "yes" : "no"}
-  - Selected file chars: ${selectedFile ? selectedFileContent.length : 0}
-  - Extra context files loaded this round: ${extraFiles.length}
-
-  RECENT CHAT HISTORY:
-  ${chatHistory || "No previous chat history."}
-
-  COMMAND:
-  @${parsed.command}
-
-  USER TASK:
-  ${parsed.task}
-
-  RULES:
-  ${commandRules}
-  `
+        RULES:
+        ${commandRules}
+        `
 
       let fullResponse = ""
 
@@ -408,16 +486,19 @@ export function WorkspaceChat({
         ...prev,
         {
           role: "assistant",
-          content: "",
+          content:
+            parsed.command === "patch"
+              ? "__PATCH_BUSY__"
+              : "",
         },
       ])
-      const loadedContextPaths = new Set<string>()
+
       for (let round = 0; round <= MAX_CONTEXT_AUTO_ROUNDS; round++) {
         fullResponse = ""
 
         const stream = await ollama.generate({
           model: selectedModel?.model || "qwen3.5:9b",
-          prompt: buildPrompt(extraContextFiles),
+          prompt: buildPrompt(),
           stream: true,
           think: thinkingEnabled,
         })
@@ -451,20 +532,23 @@ export function WorkspaceChat({
 
         const requestedFiles = getRequestedFiles(possibleJson)
           .map((path) => resolveWorkspacePath(path, workspacePath))
-          .filter((path) => !loadedContextPaths.has(path))
+          .filter((path) => {
+            if (contextManager.hasFile(path)) return false
+            if (contextManager.wasRequestedThisTurn(path)) return false
+            return true
+          })
 
         if (requestedFiles.length === 0) {
-          const continuePrompt = `${buildPrompt(extraContextFiles)}
-
-        IMPORTANT:
-        The requested context is already loaded above. Do not request more context.
-        Continue the user's task now using the loaded context.`
-
           fullResponse = ""
 
           const continueStream = await ollama.generate({
             model: selectedModel?.model || "qwen3.5:9b",
-            prompt: continuePrompt,
+            prompt: `${buildPrompt()}
+
+          IMPORTANT:
+          The requested context is already loaded or was already requested this turn.
+          Do not request the same file again.
+          Continue the user's task now.`,
             stream: true,
             think: thinkingEnabled,
           })
@@ -483,7 +567,6 @@ export function WorkspaceChat({
                   content: fullResponse,
                 }
               }
-
               return next
             })
           }
@@ -507,22 +590,43 @@ export function WorkspaceChat({
           return next
         })
 
-        const loaded = await Promise.all(
-          requestedFiles.map(async (path) => {
-            loadedContextPaths.add(path)
+        for (const path of requestedFiles) {
+          contextManager.markRequested(path)
 
-            const result = await readWorkspaceFile(path)
+          await contextManager.loadFile({
+            path,
+            workspacePath,
+            source: "requested",
+            task: parsed.task,
+            priority: 80,
+          })
+        }
 
-            return {
-              path,
-              content: result.ok
-                ? result.content || ""
-                : `[failed to read: ${result.error}]`,
+        setContextStats(contextManager.getStats(modelContextLength))
+
+        if (round === MAX_CONTEXT_AUTO_ROUNDS) {
+            fullResponse = ""
+
+            const finalPatchStream = await ollama.generate({
+              model: selectedModel?.model || "qwen3.5:9b",
+              prompt: `${buildPrompt()}
+
+          IMPORTANT:
+          You have reached the maximum automatic context loading rounds.
+          Do not request more context.
+          Return the final answer now.
+
+          If this is PATCH mode, return ONLY a valid patch_proposal JSON object.`,
+              stream: true,
+              think: thinkingEnabled,
+            })
+
+            for await (const part of finalPatchStream) {
+              fullResponse += part.response || ""
             }
-          }),
-        )
 
-        extraContextFiles = [...extraContextFiles, ...loaded]
+            break
+          }
       }
 
       if (parsed.command === "patch") {
@@ -548,7 +652,9 @@ export function WorkspaceChat({
             })
           }
         } catch {
-          setError("Patch response was not valid JSON.")
+          setError(
+            `Patch response was not valid JSON. First 500 chars:\n${fullResponse.slice(0, 500)}`,
+          )
         }
       }
     } catch (err) {
@@ -597,12 +703,23 @@ export function WorkspaceChat({
                 {item.role === "user" ? "You" : "Workspace Agent"}
               </div>
               {item.role === "assistant" ? (
-                <StreamingMarkdownContent
+                item.content === "__PATCH_BUSY__" ? (
+                  <div className="flex items-center gap-2 text-sm text-neutral-500 dark:text-neutral-400">
+                    <span>{PATCH_BUSY_MESSAGES[patchBusyIndex]}</span>
+                    <span className="inline-flex gap-1">
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.2s]" />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.1s]" />
+                      <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current" />
+                    </span>
+                  </div>
+                ) : (
+                  <StreamingMarkdownContent
                     content={item.content}
                     isStreaming={isRunning && index === messages.length - 1}
                     size="sm"
-                />
-                ) : (
+                  />
+                )
+              ) : (
                 <pre className="whitespace-pre-wrap font-sans text-sm">
                     {item.content}
                 </pre>
@@ -625,8 +742,31 @@ export function WorkspaceChat({
           <div ref={messagesEndRef} />
         </div>
       </div>
-          
+
       <div className="border-t border-neutral-300 bg-neutral-50 p-3 dark:border-neutral-800 dark:bg-neutral-900">
+        <div className="mb-2 rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs text-neutral-600 dark:border-neutral-700 dark:bg-neutral-950 dark:text-neutral-300">
+        <div className="flex items-center justify-between">
+          <span className="font-medium">Context</span>
+          <span>{contextStats.percentUsed}% used</span>
+        </div>
+
+        <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-neutral-200 dark:bg-neutral-800">
+          <div
+            className="h-full rounded-full bg-neutral-700 dark:bg-neutral-300"
+            style={{ width: `${contextStats.percentUsed}%` }}
+          />
+        </div>
+
+        <div className="mt-1 flex justify-between font-mono">
+          <span>
+            ~{contextStats.usedTokens.toLocaleString()} /{" "}
+            {contextStats.availableForContext.toLocaleString()} ctx tokens
+          </span>
+          <span>
+            model: {contextStats.modelContextLength.toLocaleString()}
+          </span>
+        </div>
+      </div>
         <textarea
           ref={textareaRef}
           value={message}
@@ -694,6 +834,7 @@ export function WorkspaceChat({
         )}
 
         <div className="mt-2 flex items-center gap-2">
+          
             <button
                 onClick={handleSend}
                 disabled={isRunning || !message.trim()}

@@ -1,3 +1,5 @@
+// src/components/workspaces/WorkspaceApi.tsx
+
 import type {
   WorkspaceFileResponse,
   WorkspaceTreeResponse,

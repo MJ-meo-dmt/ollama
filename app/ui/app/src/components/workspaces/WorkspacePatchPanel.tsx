@@ -1,3 +1,5 @@
+// src/components/workspaces/WorkspacePatchPanel.tsx
+
 import type { WorkspacePatchProposal } from "./patchTypes"
 
 type WorkspacePatchPanelProps = {

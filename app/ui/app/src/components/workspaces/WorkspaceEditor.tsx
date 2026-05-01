@@ -1,3 +1,5 @@
+// src/components/workspaces/WorkspaceEditor.tsx
+
 type WorkspaceEditorProps = {
   selectedFile: string | null
   content: string

@@ -1,3 +1,5 @@
+// src/types/workspace-webview.d.ts
+
 export {}
 
 declare global {

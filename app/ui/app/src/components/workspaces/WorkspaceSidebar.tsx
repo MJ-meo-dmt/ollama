@@ -1,3 +1,5 @@
+// src/components/workspaces/WorkspaceSidebar.tsx
+
 type RecentWorkspace = {
   name: string
   path: string

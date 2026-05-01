@@ -1,3 +1,5 @@
+// src/components/workspaces/patchTypes.ts
+
 export type WorkspacePatchFile = {
   path: string
   action: "edit" | "create" | "delete"
