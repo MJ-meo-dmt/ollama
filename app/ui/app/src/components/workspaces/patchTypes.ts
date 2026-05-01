@@ -7,7 +7,7 @@ export type WorkspacePatchAnchors = {
 
 export type WorkspacePatchFile = {
   path: string
-  action: "edit" | "create" | "delete"
+  action: "edit" | "update" | "create" | "delete"
   original_snippet: string
   replacement_snippet: string
   reason: string

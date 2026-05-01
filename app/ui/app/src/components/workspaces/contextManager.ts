@@ -125,6 +125,47 @@ export class ContextManager {
     }
   }
 
+  pruneNonRelevant(params: {
+    task: string
+    keepRecent?: boolean
+    }) {
+    const taskLower = params.task.toLowerCase()
+    const keepRecent = params.keepRecent ?? true
+    const recentCutoff = now() - 1000 * 60 * 10 // 10 minutes
+
+    for (const [path, file] of this.files.entries()) {
+        const relPath = (file.relPath || file.path).replace(/\\/g, "/").toLowerCase()
+        const baseName = relPath.split("/").pop() || relPath
+        const baseWithoutExt = baseName.replace(/\.[^.]+$/, "")
+        const isPinnedOrGuidance = file.pinned || file.source === "guidance"
+
+        const isRootGuidance =
+        !relPath.includes("/") &&
+        (baseName === "start_here.md" ||
+            baseName === "agents.md" ||
+            baseName === "rules.md")
+
+        const isMentioned =
+        taskLower.includes(baseName) ||
+        taskLower.includes(baseWithoutExt) ||
+        taskLower.includes(relPath)
+
+        const isRecent =
+        keepRecent && file.lastAccessed >= recentCutoff
+
+        !isPinnedOrGuidance
+
+        if (
+        !isRootGuidance &&
+        !isMentioned &&
+        !isRecent &&
+        !isPinnedOrGuidance
+        ) {
+        this.files.delete(path)
+        }
+    }
+    }
+
   resetTurn() {
     this.requestedThisTurn.clear()
   }

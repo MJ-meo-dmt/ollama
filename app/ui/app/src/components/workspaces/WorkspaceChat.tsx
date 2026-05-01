@@ -57,10 +57,9 @@ function resolveWorkspacePath(
 ) {
   if (!workspacePath) return requestedPath
 
-  const looksAbsolute =
-    /^[a-zA-Z]:[\\/]/.test(requestedPath) || requestedPath.startsWith("/")
+  const looksWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(requestedPath)
 
-  if (looksAbsolute) {
+  if (looksWindowsAbsolute) {
     return requestedPath
   }
 
@@ -112,7 +111,7 @@ function isValidPatchProposal(value: unknown): value is WorkspacePatchProposal {
   return proposal.files.every((file) => {
     return (
       typeof file.path === "string" &&
-      ["edit", "create", "delete"].includes(file.action) &&
+      ["edit", "update", "create", "delete"].includes(file.action) &&
       typeof file.original_snippet === "string" &&
       typeof file.replacement_snippet === "string" &&
       typeof file.reason === "string"
@@ -402,7 +401,11 @@ export function WorkspaceChat({
     }
 
     contextManager.resetTurn()
-    contextManager.clearTaskContext()
+    // Only clear volatile files, not everything
+    contextManager.pruneNonRelevant({
+      task: parsed.task,
+      keepRecent: true
+    })
 
     const mentionedFiles = getMentionedFileNames(parsed.task)
     const shouldPreloadMentionedFiles = !isCreateTask(parsed.task)
@@ -536,6 +539,9 @@ export function WorkspaceChat({
   - For create actions, do not request or read the target file first.
   - If the task is to create a new file, return a create patch immediately.
   - Paths must be relative to workspace root (no leading /)
+  - For edit actions, original_snippet must be copied exactly from LOADED CONTEXT.
+  - If the target file is not loaded in FULL mode, request it before proposing an edit patch.
+  - Never edit from a summary.
   - Return ONLY valid JSON.
   - Do not include markdown fences.
   - Do not explain outside the JSON.
@@ -559,7 +565,7 @@ export function WorkspaceChat({
     "files": [
       {
         "path": "relative/or/full/path",
-        "action": "edit|create|delete",
+        "action": "edit|update|create|delete",
         "original_snippet": "exact old text for edits, empty for create",
         "replacement_snippet": "new text",
         "anchors": {
@@ -575,11 +581,15 @@ export function WorkspaceChat({
   - Do not claim files were changed.`
           : parsed.command === "plan"
             ? `PLAN MODE RULES:
-  - Return a clear step-by-step plan.
-  - Do not write files.
-  - Do not claim changes were made.
-  - Mention which files should be inspected or changed.
-  ${contextRequestRules}`
+  - Files in LOADED CONTEXT are authoritative
+  - DO NOT request context unless absolutely missing
+  - Prefer using available context
+  - Do not output JSON context_request in plan mode unless a required file is truly absent from LOADED CONTEXT.
+
+  - Only return a plan
+  - No execution
+  - No tool references
+  `
           : `ASK MODE RULES:
   - Never invent file contents. If the requested file is not in LOADED CONTEXT, request context instead of answering.
   - If the requested file is already loaded, answer directly from it without mentioning internal context mechanics.
@@ -611,6 +621,10 @@ export function WorkspaceChat({
         4. Do not repeat old file-load failures if the file is currently loaded.
         LOADED CONTEXT:
         ${contextManager.buildPromptContext(modelContextLength)}
+        IMPORTANT:
+        - Files listed above are already loaded and available.
+        - Do NOT request them again.
+        - Only request files NOT listed above.
 
         CONTEXT BUDGET:
         ${JSON.stringify(contextManager.getStats(modelContextLength), null, 2)}
@@ -675,6 +689,28 @@ export function WorkspaceChat({
           break
         }
 
+        if (isCreatePatchTask) {
+          fullResponse = ""
+
+          const createPatchStream = await ollama.generate({
+            model: selectedModel?.model || "qwen3.5:9b",
+            prompt: `${buildPrompt()}
+
+        IMPORTANT:
+        This is a create-file patch task.
+        Do NOT request context.
+        Return ONLY a valid patch_proposal JSON object now.`,
+            stream: true,
+            think: thinkingEnabled,
+          })
+
+          for await (const part of createPatchStream) {
+            fullResponse += part.response || ""
+          }
+
+          break
+        }
+
         const requestedFiles = getRequestedFiles(possibleJson)
           .map((path) => resolveWorkspacePath(path, workspacePath))
           .filter((path) => {
@@ -691,9 +727,15 @@ export function WorkspaceChat({
             prompt: `${buildPrompt()}
 
           IMPORTANT:
-          The requested context is already loaded or was already requested this turn.
-          Do not request the same file again.
-          Continue the user's task now.`,
+          The requested files are already loaded or were already requested this turn.
+          You MUST NOT request them again.
+
+          STRICT MODE:
+          - If COMMAND is @patch, return ONLY a valid patch_proposal JSON object.
+          - If COMMAND is @plan, return ONLY a plan. Do not mention tools or execution.
+          - If COMMAND is @ask, answer directly from LOADED CONTEXT.
+
+          Continue now.`,
             stream: true,
             think: thinkingEnabled,
           })

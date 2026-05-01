@@ -343,7 +343,8 @@ export default function WorkspacePage() {
   const [selectedFile, setSelectedFile] = useState<string | null>(null)
   const [recentWorkspaces, setRecentWorkspaces] = useState<RecentWorkspace[]>([])
   const [leftWidth, setLeftWidth] = useState(280)
-  const [rightWidth, setRightWidth] = useState(420)
+  const [rightWidth, setRightWidth] = useState(480)
+  const [patchHeight, setPatchHeight] = useState(360)
 
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceNode | null>(null)
@@ -440,7 +441,10 @@ export default function WorkspacePage() {
     setWorkspaceNotice("Applying patch...")
 
     const supportedFiles = patchProposal.files.filter(
-      (file) => file.action === "edit" || file.action === "create",
+      (file) =>
+        file.action === "edit" ||
+        file.action === "update" ||
+        file.action === "create",
     )
 
     if (supportedFiles.length === 0) {
@@ -488,6 +492,11 @@ export default function WorkspacePage() {
         return
       }
 
+      console.log("Patch target:", targetPath)
+      console.log("Original snippet:", patchFile.original_snippet)
+      console.log("Replacement snippet:", patchFile.replacement_snippet)
+      console.log("Current content:", current.content)
+
       const updatedContent = applySnippetPatch(
         current.content,
         patchFile.original_snippet,
@@ -497,7 +506,7 @@ export default function WorkspacePage() {
 
     if (updatedContent === null) {
       setWorkspaceError(
-        `Original snippet not found in ${targetPath}. Patch was not applied.`,
+        `Original snippet not found in ${targetPath}. Patch was not applied. The model likely produced a snippet that does not match the current file exactly.`,
       )
       return
     }
@@ -531,6 +540,24 @@ export default function WorkspacePage() {
     setTimeout(() => setWorkspaceNotice(null), 2500)
   }
 
+  const startPatchResize = (event: React.MouseEvent<HTMLDivElement>) => {
+    const startY = event.clientY
+    const startHeight = patchHeight
+
+    const onMouseMove = (moveEvent: MouseEvent) => {
+      const nextHeight = startHeight - (moveEvent.clientY - startY)
+      setPatchHeight(Math.max(180, Math.min(nextHeight, 720)))
+    }
+
+    const onMouseUp = () => {
+      window.removeEventListener("mousemove", onMouseMove)
+      window.removeEventListener("mouseup", onMouseUp)
+    }
+
+    window.addEventListener("mousemove", onMouseMove)
+    window.addEventListener("mouseup", onMouseUp)
+  }
+
   const startLeftResize = (event: React.MouseEvent<HTMLDivElement>) => {
     const startX = event.clientX
     const startWidth = leftWidth
@@ -555,7 +582,7 @@ export default function WorkspacePage() {
 
     const onMouseMove = (moveEvent: MouseEvent) => {
       const nextWidth = startWidth - (moveEvent.clientX - startX)
-      setRightWidth(Math.max(320, Math.min(nextWidth, 620)))
+      setRightWidth(Math.max(360, Math.min(nextWidth, 900)))
     }
 
     const onMouseUp = () => {
@@ -648,7 +675,7 @@ useEffect(() => {
       }
       showNewChatButton={false}
     >
-      <main className="flex h-screen w-full flex-col dark:bg-neutral-900">
+      <main className="flex h-[100dvh] min-h-0 w-full flex-col overflow-hidden dark:bg-neutral-900">
         <header className="w-full flex flex-none justify-between h-[52px] py-2.5 items-center border-b border-neutral-200 dark:border-neutral-800">
           <h1
             className={`flex items-center font-rounded text-md font-medium dark:text-white ${
@@ -695,7 +722,7 @@ useEffect(() => {
             </div>
           )}
         <div
-          className="flex-1 grid overflow-hidden"
+          className="min-h-0 flex-1 grid overflow-hidden"
           style={{
             gridTemplateColumns: `${leftWidth}px 4px minmax(0, 1fr) 4px ${rightWidth}px`,
           }}
@@ -723,13 +750,23 @@ useEffect(() => {
           </div>
 
           {patchProposal && (
-            <div className="max-h-[45%] overflow-auto border-t border-neutral-200 dark:border-neutral-800">
-              <WorkspacePatchPanel
-                proposal={patchProposal}
-                onClear={() => setPatchProposal(null)}
-                onApply={handleApplyPatch}
+            <>
+              <div
+                onMouseDown={startPatchResize}
+                className="h-1.5 cursor-row-resize bg-neutral-200 hover:bg-neutral-300 dark:bg-neutral-800 dark:hover:bg-neutral-700"
               />
-            </div>
+
+              <div
+                className="shrink-0 overflow-auto border-t border-neutral-200 dark:border-neutral-800"
+                style={{ height: `${patchHeight}px` }}
+              >
+                <WorkspacePatchPanel
+                  proposal={patchProposal}
+                  onClear={() => setPatchProposal(null)}
+                  onApply={handleApplyPatch}
+                />
+              </div>
+            </>
           )}
         </div>
 
