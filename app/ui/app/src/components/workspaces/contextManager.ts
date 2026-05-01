@@ -184,22 +184,7 @@ export class ContextManager {
     const result = await readWorkspaceFile(params.path)
 
     if (!result.ok) {
-    const file: ContextFile = {
-        path: normalized,
-        relPath: getRelPath(normalized, params.workspacePath),
-        content: `[failed to read: ${result.error}]`,
-        source: params.source,
-        mode: "partial",
-        tokensEstimate: estimateTokens(result.error || "failed to read file"),
-        rawChars: 0,
-        priority: params.priority ?? this.getBasePriority(params.source),
-        pinned: false,
-        lastAccessed: now(),
-        timesUsed: 1,
-    }
-
-    this.files.set(normalized, file)
-    return file
+    throw new Error(result.error || `Failed to read ${params.path}`)
     }
 
     const content = result.content || ""

@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react"
 import StreamingMarkdownContent from "@/components/StreamingMarkdownContent"
+import { useQuery } from "@tanstack/react-query"
+import { getSettings, getInferenceCompute } from "@/api"
 import ollama from "ollama/browser"
 import type { WorkspaceNode } from "@/types/workspace-webview"
 import type { WorkspacePatchProposal } from "./patchTypes"
@@ -99,6 +101,25 @@ function isContextRequest(value: unknown): value is ContextRequest {
   )
 }
 
+function isValidPatchProposal(value: unknown): value is WorkspacePatchProposal {
+  if (typeof value !== "object" || value === null) return false
+
+  const proposal = value as WorkspacePatchProposal
+
+  if (proposal.type !== "patch_proposal") return false
+  if (!Array.isArray(proposal.files)) return false
+
+  return proposal.files.every((file) => {
+    return (
+      typeof file.path === "string" &&
+      ["edit", "create", "delete"].includes(file.action) &&
+      typeof file.original_snippet === "string" &&
+      typeof file.replacement_snippet === "string" &&
+      typeof file.reason === "string"
+    )
+  })
+}
+
 function parseWorkspaceCommand(input: string): {
   command: WorkspaceCommand
   task: string
@@ -129,15 +150,8 @@ function parseWorkspaceCommand(input: string): {
   return { command: "ask", task: trimmed }
 }
 
-function getModelContextLength(modelName?: string) {
-  const name = (modelName || "").toLowerCase()
-
-  if (name.includes("qwen3.5") || name.includes("qwen3.6")) return 32768
-  if (name.includes("granite")) return 128000
-  if (name.includes("mistral") || name.includes("ministral")) return 32768
-  if (name.includes("llama")) return 32768
-
-  return 32768
+function isCreateTask(task: string) {
+  return /\b(create|new file|add file|make file)\b/i.test(task)
 }
 
 function getBaseName(path: string) {
@@ -162,8 +176,44 @@ function getMentionedFileNames(task: string) {
   return (
     task
       .toLowerCase()
-      .match(/[\w.-]+\.(ts|tsx|js|jsx|md|json|css|html|go|py|rs)/g) ?? []
-  )
+      .match(/(?:\/?[\w.-]+)*\/?[\w.-]+\.(ts|tsx|js|jsx|md|json|css|html|go|py|rs)/g) ?? []
+  ).map((file) => file.replace(/^\/+/, ""))
+}
+
+function findBareFileMentionInWorkspaceMap(
+  task: string,
+  workspaceMap: string,
+  workspacePath: string | null,
+) {
+  if (!workspacePath) return null
+
+  const taskLower = task.toLowerCase()
+  const stack: string[] = []
+
+  for (const line of workspaceMap.split(/\r?\n/)) {
+    if (!line.trim() || line.includes("[workspace map trimmed]")) continue
+
+    const depth = Math.floor((line.match(/^ */)?.[0].length || 0) / 2)
+    const cleanName = line.trim().replace(/\/$/, "")
+    const lowerName = cleanName.toLowerCase()
+
+    stack[depth] = cleanName
+    stack.length = depth + 1
+
+    if (!lowerName.includes(".")) continue
+
+    const baseName = lowerName.split(".")[0]
+
+    if (taskLower.includes(baseName)) {
+      const relPath = stack.slice(1).join("/")
+
+      if (!relPath) return null
+
+      return `${workspacePath.replace(/[\\/]+$/, "")}/${relPath}`
+    }
+  }
+
+  return null
 }
 
 function findMentionedFileInWorkspaceMap(
@@ -173,7 +223,7 @@ function findMentionedFileInWorkspaceMap(
 ) {
   if (!workspacePath) return null
 
-  const target = fileName.toLowerCase()
+  const target = fileName.toLowerCase().replace(/^\/+/, "")
   const stack: string[] = []
 
   for (const line of workspaceMap.split(/\r?\n/)) {
@@ -185,9 +235,14 @@ function findMentionedFileInWorkspaceMap(
     stack[depth] = cleanName
     stack.length = depth + 1
 
-    if (cleanName.toLowerCase() === target) {
-      const relPath = stack.slice(1).join("/")
-      return `${workspacePath.replace(/[\\/]+$/, "")}/${relPath}`
+    const relPath = stack.slice(1).join("/").toLowerCase()
+
+    if (
+      relPath === target ||
+      cleanName.toLowerCase() === target ||
+      relPath.endsWith(`/${target}`)
+    ) {
+      return `${workspacePath.replace(/[\\/]+$/, "")}/${stack.slice(1).join("/")}`
     }
   }
 
@@ -229,9 +284,33 @@ export function WorkspaceChat({
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const [thinkingEnabled, setThinkingEnabled] = useState(false)
   const { selectedModel } = useSelectedModel()
+  const { data: settingsData } = useQuery({
+    queryKey: ["settings"],
+    queryFn: getSettings,
+  })
+
+  const { data: inferenceComputeResponse } = useQuery({
+    queryKey: ["inferenceCompute"],
+    queryFn: getInferenceCompute,
+  })
+
+  const modelContextLength =
+    settingsData?.settings?.ContextLength ||
+    inferenceComputeResponse?.defaultContextLength ||
+    32768
 
   const [commandMenuOpen, setCommandMenuOpen] = useState(false)
   const [commandIndex, setCommandIndex] = useState(0)
+  const commandQuery = message.startsWith("@")
+    ? message.slice(1).toLowerCase()
+    : ""
+
+  const filteredCommands =
+    commandQuery.length > 0
+      ? WORKSPACE_COMMANDS.filter((command) =>
+          command.name.slice(1).startsWith(commandQuery),
+        )
+      : WORKSPACE_COMMANDS
 
   const [patchBusyIndex, setPatchBusyIndex] = useState(0)
 
@@ -276,8 +355,6 @@ export function WorkspaceChat({
     }
 
     const parsed = parseWorkspaceCommand(userMessage)
-
-    const modelContextLength = getModelContextLength(selectedModel?.model)
     const contextManager = contextManagerRef.current
 
     if (parsed.command === "context") {
@@ -328,19 +405,25 @@ export function WorkspaceChat({
     contextManager.clearTaskContext()
 
     const mentionedFiles = getMentionedFileNames(parsed.task)
+    const shouldPreloadMentionedFiles = !isCreateTask(parsed.task)
 
     let focusedFileFromTask: string | null = null
 
-    for (const fileName of mentionedFiles) {
+    if (shouldPreloadMentionedFiles) {
+      for (const fileName of mentionedFiles) {
       const resolved = findMentionedFileInWorkspaceMap(
         fileName,
         workspaceMap,
         workspacePath,
       )
 
-      if (resolved) {
-        focusedFileFromTask = resolved
+      if (!resolved) {
+        continue
+      }
 
+      focusedFileFromTask = resolved
+
+      try {
         await contextManager.loadFile({
           path: resolved,
           workspacePath,
@@ -348,6 +431,37 @@ export function WorkspaceChat({
           task: parsed.task,
           priority: 98,
         })
+      } catch (err) {
+        setError(err instanceof Error ? err.message : `Failed to load ${resolved}`)
+      }
+    }
+  }
+
+    if (!focusedFileFromTask && shouldPreloadMentionedFiles) {
+      const resolvedBareMention = findBareFileMentionInWorkspaceMap(
+        parsed.task,
+        workspaceMap,
+        workspacePath,
+      )
+
+      if (resolvedBareMention) {
+        focusedFileFromTask = resolvedBareMention
+
+        try {
+          await contextManager.loadFile({
+            path: resolvedBareMention,
+            workspacePath,
+            source: "requested",
+            task: parsed.task,
+            priority: 98,
+          })
+        } catch (err) {
+          setError(
+            err instanceof Error
+              ? err.message
+              : `Failed to load ${resolvedBareMention}`,
+          )
+        }
       }
     }
 
@@ -387,6 +501,16 @@ export function WorkspaceChat({
 
     try {
       const chatHistory = messages
+        .filter((item) => {
+          const text = item.content.toLowerCase()
+
+          return (
+            !text.includes("failed to load") &&
+            !text.includes("failed to read") &&
+            !text.includes("file unreadable") &&
+            !text.includes("missing at")
+          )
+        })
         .slice(-6)
         .map((item) => `${item.role.toUpperCase()}:\n${item.content}`)
         .join("\n\n")
@@ -404,14 +528,25 @@ export function WorkspaceChat({
   - Ask for the fewest files needed.
   - Prefer files mentioned by guidance files or the workspace map.
   - Use full paths if they are already shown in the workspace context.`
-
+      const isCreatePatchTask =
+        parsed.command === "patch" && isCreateTask(parsed.task)
       const commandRules =
         parsed.command === "patch"
           ? `PATCH MODE RULES:
+  - For create actions, do not request or read the target file first.
+  - If the task is to create a new file, return a create patch immediately.
+  - Paths must be relative to workspace root (no leading /)
   - Return ONLY valid JSON.
   - Do not include markdown fences.
   - Do not explain outside the JSON.
-  ${contextRequestRules}
+  - Prefer exact original_snippet matching when possible.
+  - If exact matching may be fragile, include anchors.before and anchors.after.
+  - anchors.before should be stable text immediately before the replacement area.
+  - anchors.after should be stable text immediately after the replacement area.
+  - Do not use anchors unless they are copied from loaded context.
+  ${isCreatePatchTask ? "" : contextRequestRules}
+  - Never output read or context_request actions in create tasks.
+  - For create tasks, you already have enough information.
   - If required context is missing, request context first.
   - After context is loaded, you MUST return a patch_proposal JSON object.
   - For create actions, use original_snippet as an empty string.
@@ -427,6 +562,10 @@ export function WorkspaceChat({
         "action": "edit|create|delete",
         "original_snippet": "exact old text for edits, empty for create",
         "replacement_snippet": "new text",
+        "anchors": {
+          "before": "optional stable text before edit",
+          "after": "optional stable text after edit"
+        },
         "reason": "why this change is needed"
       }
     ],
@@ -442,6 +581,7 @@ export function WorkspaceChat({
   - Mention which files should be inspected or changed.
   ${contextRequestRules}`
           : `ASK MODE RULES:
+  - Never invent file contents. If the requested file is not in LOADED CONTEXT, request context instead of answering.
   - If the requested file is already loaded, answer directly from it without mentioning internal context mechanics.
   - If the requested file is not loaded, request it as context first.
   - Explain clearly.
@@ -461,14 +601,19 @@ export function WorkspaceChat({
         WORKSPACE MAP:
         ${workspaceMap || "No workspace map available."}
 
+        RECENT CHAT HISTORY:
+        ${chatHistory || "No previous chat history."}
+
+        CONTEXT PRIORITY:
+        1. LOADED CONTEXT is authoritative.
+        2. RECENT CHAT HISTORY is only conversation memory.
+        3. If they conflict, trust LOADED CONTEXT.
+        4. Do not repeat old file-load failures if the file is currently loaded.
         LOADED CONTEXT:
         ${contextManager.buildPromptContext(modelContextLength)}
 
         CONTEXT BUDGET:
         ${JSON.stringify(contextManager.getStats(modelContextLength), null, 2)}
-
-        RECENT CHAT HISTORY:
-        ${chatHistory || "No previous chat history."}
 
         COMMAND:
         @${parsed.command}
@@ -574,25 +719,20 @@ export function WorkspaceChat({
           break
         }
 
-        setMessages((prev) => {
-          const next = [...prev]
-          const lastIndex = next.length - 1
-
-          if (lastIndex >= 0 && next[lastIndex].role === "assistant") {
-            next[lastIndex] = {
-              ...next[lastIndex],
-              content: `Loading requested context:\n\n${requestedFiles
-                .map((file) => `- ${file}`)
-                .join("\n")}`,
-            }
-          }
-
-          return next
-        })
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: "assistant",
+            content: `Loading requested context:\n\n${requestedFiles
+              .map((file) => `- ${file}`)
+              .join("\n")}`,
+          },
+        ])
 
         for (const path of requestedFiles) {
           contextManager.markRequested(path)
 
+          try {
           await contextManager.loadFile({
             path,
             workspacePath,
@@ -600,7 +740,10 @@ export function WorkspaceChat({
             task: parsed.task,
             priority: 80,
           })
+        } catch (err) {
+          setError(err instanceof Error ? err.message : `Failed to load ${path}`)
         }
+      }
 
         setContextStats(contextManager.getStats(modelContextLength))
 
@@ -631,9 +774,9 @@ export function WorkspaceChat({
 
       if (parsed.command === "patch") {
         try {
-          const proposal = JSON.parse(fullResponse) as WorkspacePatchProposal
+          const proposal = extractJsonObject(fullResponse) as WorkspacePatchProposal | null
 
-          if (proposal.type === "patch_proposal") {
+          if (isValidPatchProposal(proposal)) {
             onPatchProposal?.(proposal)
 
             setMessages((prev) => {
@@ -645,6 +788,25 @@ export function WorkspaceChat({
                   ...next[lastIndex],
                   content:
                     "Patch proposal generated. Review it in the patch panel.",
+                }
+              }
+
+              return next
+            })
+          }
+           else {
+            setError(
+              `Invalid patch proposal. Expected only edit/create/delete actions. First 500 chars:\n${fullResponse.slice(0, 500)}`,
+            )
+
+            setMessages((prev) => {
+              const next = [...prev]
+              const lastIndex = next.length - 1
+
+              if (lastIndex >= 0 && next[lastIndex].role === "assistant") {
+                next[lastIndex] = {
+                  ...next[lastIndex],
+                  content: "Patch proposal failed validation. See error details below.",
                 }
               }
 
@@ -666,11 +828,25 @@ export function WorkspaceChat({
     
   return (
     <section className="flex h-full flex-col overflow-hidden border-l border-neutral-300 bg-neutral-100 dark:border-neutral-800 dark:bg-neutral-900">
-      <div className="border-b border-neutral-300 bg-neutral-50 p-4 dark:border-neutral-800 dark:bg-neutral-900">
-        <h2 className="font-medium dark:text-white">Workspace Chat</h2>
-        <p className="mt-1 text-xs text-neutral-500">
-          Uses selected file + guidance files as context.
-        </p>
+      <div className="flex items-start justify-between border-b border-neutral-300 bg-neutral-50 p-4 dark:border-neutral-800 dark:bg-neutral-900">
+        <div>
+          <h2 className="font-medium dark:text-white">Workspace Chat</h2>
+          <p className="mt-1 text-xs text-neutral-500">
+            Uses selected file + guidance files as context.
+          </p>
+        </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            localStorage.removeItem(CHAT_STORAGE_KEY)
+            setMessages([])
+            setError(null)
+          }}
+          className="rounded-lg border border-neutral-200 px-2.5 py-1.5 text-xs text-neutral-600 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+        >
+          Clear chat
+        </button>
       </div>
 
       <div className="flex-1 overflow-auto p-4 text-sm">
@@ -763,7 +939,7 @@ export function WorkspaceChat({
             {contextStats.availableForContext.toLocaleString()} ctx tokens
           </span>
           <span>
-            model: {contextStats.modelContextLength.toLocaleString()}
+            ctx setting: {contextStats.modelContextLength.toLocaleString()}
           </span>
         </div>
       </div>
@@ -782,21 +958,25 @@ export function WorkspaceChat({
             if (commandMenuOpen) {
               if (event.key === "ArrowDown") {
                 event.preventDefault()
-                setCommandIndex((prev) => (prev + 1) % WORKSPACE_COMMANDS.length)
+                setCommandIndex((prev) => (prev + 1) % filteredCommands.length)
                 return
               }
 
               if (event.key === "ArrowUp") {
                 event.preventDefault()
                 setCommandIndex((prev) =>
-                  prev === 0 ? WORKSPACE_COMMANDS.length - 1 : prev - 1,
+                  prev === 0 ? filteredCommands.length - 1 : prev - 1,
                 )
                 return
               }
 
               if (event.key === "Tab" || event.key === "Enter") {
                 event.preventDefault()
-                selectCommand(WORKSPACE_COMMANDS[commandIndex].name)
+                const selectedCommand = filteredCommands[commandIndex]
+
+                if (selectedCommand) {
+                  selectCommand(selectedCommand.name)
+                }
                 return
               }
 
@@ -816,7 +996,7 @@ export function WorkspaceChat({
         />
         {commandMenuOpen && (
           <div className="mt-2 overflow-hidden rounded-xl border border-neutral-700 bg-neutral-900 text-sm shadow-xl">
-            {WORKSPACE_COMMANDS.map((command, index) => (
+            {filteredCommands.map((command, index) => (
               <button
                 key={command.name}
                 onClick={() => selectCommand(command.name)}

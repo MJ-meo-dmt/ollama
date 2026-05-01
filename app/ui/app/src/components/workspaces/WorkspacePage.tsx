@@ -73,36 +73,169 @@ function findGuidance(node: WorkspaceNode): WorkspaceNode[] {
   return results
 }
 
+type PatchAnchors = {
+  before?: string
+  after?: string
+}
+
+function normalizeLineEndings(value: string) {
+  return value.replace(/\r\n/g, "\n")
+}
+
+function normalizeLoose(value: string) {
+  return normalizeLineEndings(value)
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim()
+}
+
+function preserveLineEndings(original: string, updated: string) {
+  return original.includes("\r\n") ? updated.replace(/\n/g, "\r\n") : updated
+}
+
+function findLooseMatchRange(content: string, snippet: string) {
+  const contentLines = normalizeLineEndings(content).split("\n")
+  const snippetLines = normalizeLineEndings(snippet).split("\n")
+
+  const normalizedSnippet = normalizeLoose(snippet)
+
+  for (let start = 0; start < contentLines.length; start++) {
+    for (
+      let end = start + 1;
+      end <= Math.min(contentLines.length, start + snippetLines.length + 4);
+      end++
+    ) {
+      const candidate = contentLines.slice(start, end).join("\n")
+
+      if (normalizeLoose(candidate) === normalizedSnippet) {
+        return { start, end }
+      }
+    }
+  }
+
+  return null
+}
+
+function applyAnchorPatch(
+  currentContent: string,
+  replacementSnippet: string,
+  anchors?: PatchAnchors,
+): string | null {
+  if (!anchors?.before && !anchors?.after) {
+    return null
+  }
+
+  const normalizedCurrent = normalizeLineEndings(currentContent)
+  const lines = normalizedCurrent.split("\n")
+
+  const before = anchors.before ? normalizeLoose(anchors.before) : null
+  const after = anchors.after ? normalizeLoose(anchors.after) : null
+
+  let beforeEnd = 0
+  let afterStart = lines.length
+
+  if (before) {
+    let found = false
+
+    for (let start = 0; start < lines.length; start++) {
+      for (let end = start + 1; end <= Math.min(lines.length, start + 12); end++) {
+        const candidate = lines.slice(start, end).join("\n")
+
+        if (normalizeLoose(candidate) === before) {
+          beforeEnd = end
+          found = true
+          break
+        }
+      }
+
+      if (found) break
+    }
+
+    if (!found) return null
+  }
+
+  if (after) {
+    let found = false
+
+    for (let start = beforeEnd; start < lines.length; start++) {
+      for (let end = start + 1; end <= Math.min(lines.length, start + 12); end++) {
+        const candidate = lines.slice(start, end).join("\n")
+
+        if (normalizeLoose(candidate) === after) {
+          afterStart = start
+          found = true
+          break
+        }
+      }
+
+      if (found) break
+    }
+
+    if (!found) return null
+  }
+
+  if (beforeEnd > afterStart) {
+    return null
+  }
+
+  const updatedLines = [
+    ...lines.slice(0, beforeEnd),
+    replacementSnippet,
+    ...lines.slice(afterStart),
+  ]
+
+  return preserveLineEndings(currentContent, updatedLines.join("\n"))
+}
+
 function applySnippetPatch(
   currentContent: string,
   originalSnippet: string,
   replacementSnippet: string,
+  anchors?: PatchAnchors,
 ): string | null {
-  // First try exact match
-  if (currentContent.includes(originalSnippet)) {
+  // 1. Exact match first.
+  if (originalSnippet && currentContent.includes(originalSnippet)) {
     return currentContent.replace(originalSnippet, replacementSnippet)
   }
 
-  // Then try normalized line endings
-  const normalizedCurrent = currentContent.replace(/\r\n/g, "\n")
-  const normalizedOriginal = originalSnippet.replace(/\r\n/g, "\n")
-  const normalizedReplacement = replacementSnippet.replace(/\r\n/g, "\n")
+  // 2. Normalized line-ending exact match.
+  const normalizedCurrent = normalizeLineEndings(currentContent)
+  const normalizedOriginal = normalizeLineEndings(originalSnippet)
+  const normalizedReplacement = normalizeLineEndings(replacementSnippet)
 
-  if (!normalizedCurrent.includes(normalizedOriginal)) {
-    return null
+  if (originalSnippet && normalizedCurrent.includes(normalizedOriginal)) {
+    const updated = normalizedCurrent.replace(
+      normalizedOriginal,
+      normalizedReplacement,
+    )
+
+    return preserveLineEndings(currentContent, updated)
   }
 
-  const updatedNormalized = normalizedCurrent.replace(
-    normalizedOriginal,
-    normalizedReplacement,
-  )
+  // 3. Loose whitespace match.
+  if (originalSnippet) {
+    const range = findLooseMatchRange(currentContent, originalSnippet)
 
-  // Preserve original file's Windows line endings if it used CRLF
-  const usesCrlf = currentContent.includes("\r\n")
+    if (range) {
+      const lines = normalizeLineEndings(currentContent).split("\n")
 
-  return usesCrlf
-    ? updatedNormalized.replace(/\n/g, "\r\n")
-    : updatedNormalized
+      const updatedLines = [
+        ...lines.slice(0, range.start),
+        normalizedReplacement,
+        ...lines.slice(range.end),
+      ]
+
+      return preserveLineEndings(currentContent, updatedLines.join("\n"))
+    }
+  }
+
+  // 4. Anchor-based fallback.
+  return applyAnchorPatch(currentContent, normalizedReplacement, anchors)
+}
+
+function normalizeWorkspacePath(path: string) {
+  return path.replace(/^[/\\]+/, "") // remove leading slash
 }
 
 function buildWorkspaceMap(
@@ -193,14 +326,15 @@ function getActiveGuidanceForFile(
 function resolveWorkspacePath(path: string, workspacePath: string | null) {
   if (!workspacePath) return path
 
-  const looksAbsolute =
-    /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith("/")
+  const normalizedPath = path.replace(/^[/\\]+/, "")
 
-  if (looksAbsolute) {
+  const looksWindowsAbsolute = /^[a-zA-Z]:[\\/]/.test(path)
+
+  if (looksWindowsAbsolute) {
     return path
   }
 
-  return `${workspacePath.replace(/[\\/]+$/, "")}/${path.replace(/^[/\\]+/, "")}`
+  return `${workspacePath.replace(/[\\/]+$/, "")}/${normalizedPath}`
 }
 
 export default function WorkspacePage() {
@@ -315,7 +449,8 @@ export default function WorkspacePage() {
     }
 
     for (const patchFile of supportedFiles) {
-      const targetPath = resolveWorkspacePath(patchFile.path, workspacePath)
+      const safeRelPath = normalizeWorkspacePath(patchFile.path)
+      const targetPath = resolveWorkspacePath(safeRelPath, workspacePath)
       if (patchFile.action === "create") {
         const existing = await readWorkspaceFile(targetPath)
 
@@ -357,6 +492,7 @@ export default function WorkspacePage() {
         current.content,
         patchFile.original_snippet,
         patchFile.replacement_snippet,
+        patchFile.anchors,
       )
 
     if (updatedContent === null) {
@@ -365,7 +501,6 @@ export default function WorkspacePage() {
       )
       return
     }
-
       const writeResult = await writeWorkspaceFile(
         targetPath,
         updatedContent,
