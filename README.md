@@ -1,109 +1,242 @@
 # Ollama — Workspace UI Experiment
 
-This fork extends the original Ollama app with a **local workspace-aware agent UI**.
+This fork extends the original Ollama app with a **local-first, workspace-aware coding agent UI**.
 
-> 👉 Original project: [https://github.com/ollama/ollama](https://github.com/ollama/ollama)
+> 👉 Original project: https://github.com/ollama/ollama
 
 ---
 
 ## Workspace UI POC
+> *FYI This workspace is filled with random stuff by now while testing*
 
-![Workspace UI POC](workspace-ui-poc/workspace_ui_wip.png)
-![Workspace UI POC](workspace-ui-poc/workspace_ui_2.png)
-![Workspace UI POC](workspace-ui-poc/workspace_ui_3.png)
-![Workspace UI POC](workspace-ui-poc/workspace_ui_4.png)
+![Workspace UI POC](workspace-ui-poc/workspace_ui_ask.png)  
+![Workspace UI POC](workspace-ui-poc/workspace_ui_plan.png)  
+![Workspace UI POC](workspace-ui-poc/workspace_ui_patch_edit.png)  
+![Workspace UI POC](workspace-ui-poc/workspace_ui_patch_create.png)  
+![Workspace UI POC](workspace-ui-poc/workspace_ui_ctx.png)
 
 ---
 
-## What’s added
+# What this actually is
 
-### Workspace awareness
+A local-first coding agent runtime
+that safely reads, reasons about, and edits a workspace
+using structured context and user-approved patches.
 
-* Local workspace explorer (VS Code–style)
-* File viewer + selection
-* Workspace map (model knows available files)
+---
+
+# Features
+
+## Workspace awareness
+
+* VS Code–style file explorer
+* File selection + viewer
+* Workspace map (model-aware file structure)
 * Recent workspace memory (quick reopen)
 
-### Context system
+---
 
-* Guidance chain detection (`START_HERE.md`, `AGENTS.md`, `context.md`, `rules.md`)
-* Structured context injection (no full project stuffing)
-* Auto context loading via model requests
-* Multi-round context fetching loop (agent can request more files)
+## Context system (CORE)
 
-### Agent interaction
+* **ContextManager (stateful memory layer)**
+* Guidance chain detection:
 
-* Command system:
+  * `START_HERE.md`
+  * `rules.md`
+  * `AGENTS.md`
+  * `context.md`
+* Smart context loading:
 
-  * `@ask` → explain / inspect
-  * `@plan` → structured planning
-  * `@patch` → propose changes
-  * `@context` → inspect loaded context
-* Command autocomplete UI (`@` menu + keyboard navigation)
-* Streaming responses (live model output)
-* Model picker (switch models per request)
-* Optional “Think” mode toggle
+  * only relevant files
+  * no full project stuffing
+* Multi-round context request loop
+* Prevents duplicate reads + infinite loops
+* Token-aware context budgeting
+* Full vs summary loading for large files
 
-### Patch system (core feature)
-
-* Structured patch proposals (JSON → UI panel)
-* Supports:
-
-  * `edit`
-  * `create`
-* Safe apply pipeline:
-
-  * Resolve relative paths → workspace root
-  * Prevent writes outside workspace
-  * Snippet-based patching (no blind overwrite)
-* Patch panel with:
-
-  * original vs replacement view
-  * apply / clear controls
-
-### UX improvements
-
-* Chat history persistence (localStorage)
-* Auto scroll + auto focus
-* Cleaner output (raw JSON hidden from chat)
-* Softened UI (less harsh white)
+👉 The agent does **not guess** — it reads only what it needs.
 
 ---
 
-## Status
+## Agent interaction
 
-Prototype / experimental branch (`workspace-ui`)
+Command-driven interface:
 
-Current capabilities:
+* `@ask` → explain / inspect
+* `@plan` → structured plan
+* `@patch` → propose changes
+* `@context` → inspect current context
+
+Additional:
+
+* Command autocomplete (`@` menu)
+* Streaming responses
+* Model picker (per request)
+* Optional “Think” mode
+* Chat history persistence
+
+---
+
+## Patch system (core capability)
+
+Structured patch pipeline:
+
+```json
+{
+  "type": "patch_proposal",
+  "files": [...]
+}
+```
+
+Supports:
+
+* `edit`
+* `create`
+
+Safety features:
+
+* Workspace root enforcement (no escape)
+* Path normalization (fixes `/docs` vs `docs`)
+* Create-task detection (no unnecessary reads)
+* JSON validation + fallback handling
+* Prevents invalid patch outputs
+
+Patch panel:
+
+* original vs replacement view
+* apply / clear controls
+* per-file reasoning
+
+---
+
+## Context + Model awareness
+
+* Dynamic context size tracking
+* Uses Ollama model context settings (when available)
+* UI shows:
+
+  * tokens used
+  * tokens remaining
+  * model context limit
+
+---
+
+## UX improvements
+
+* Context usage panel (live token bar)
+* Patch “busy / preparing” indicator
+* Cleaner chat output (no raw JSON spam)
+* Auto scroll + focus
+* Clear chat button
+* Improved command matching behavior
+
+---
+
+# Current System Flow
 
 ```text
-LLM → requests context → loads files → reasons → proposes patch → user approves → writes safely
+User prompt
+→ ContextManager builds context
+→ Model responds
+
+→ If more context needed:
+    request files
+    load + cache
+    retry
+
+→ Final result:
+    explanation OR patch proposal
+
+→ User reviews → apply patch
 ```
 
 ---
 
-## Example workflow
+# Current Status
 
-1. Open a workspace folder
-2. Select a file
-3. Ask:
-
-   ```
-   @ask explain this file
-   ```
-4. Let agent fetch missing context automatically
-5. Plan:
-
-   ```
-   @plan refactor this logic
-   ```
-6. Propose change:
-
-   ```
-   @patch add validation
-   ```
-7. Review → Apply patch
+Branch: `workspace-ui`
+State: **Functional prototype → evolving into agent runtime**
 
 ---
 
+## What works well
+
+* Context-aware reasoning (no hallucinated file content)
+* Multi-file understanding
+* Safe patch generation (create/edit)
+* Context request loop (stable + bounded)
+* Token-aware context control
+
+---
+
+## What’s next
+
+### 1. Patch matcher engine (IN PROGRESS)
+
+* whitespace normalization
+* anchor-based matching
+* confidence scoring
+
+### 2. Diff viewer
+
+* proper code diff instead of raw snippets
+
+### 3. Context persistence
+
+* retain context across sessions
+
+### 4. Memory layer (embeddings)
+
+* semantic retrieval for large projects
+
+### 5. Auto agent mode
+
+* plan → act → repeat loop
+
+---
+
+# Design philosophy
+
+Guidance-driven
++ Context-on-demand
++ Safe execution
+
+
+NOT:
+
+* full project stuffing
+* blind edits
+* uncontrolled agents
+
+---
+
+# Example workflow
+
+1. Open workspace
+2. Select a file
+
+```
+@ask explain this file
+```
+
+3. Let agent fetch missing context
+
+```
+@plan refactor this logic
+```
+
+4. Generate change:
+
+```
+@patch add validation
+```
+
+5. Review → Apply
+
+---
+
+# One-line summary
+
+
+A local-first, context-aware coding agent that safely reads and edits your project using structured reasoning and controlled patches.
 
