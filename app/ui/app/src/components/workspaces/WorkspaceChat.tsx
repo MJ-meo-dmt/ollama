@@ -323,7 +323,8 @@ export function WorkspaceChat({
 
   useEffect(() => {
     contextManagerRef.current.clearTaskContext()
-  }, [contextRevision])
+    setContextStats(contextManagerRef.current.getStats(modelContextLength))
+  }, [contextRevision, modelContextLength])
 
   useEffect(() => {
     localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages))
@@ -363,6 +364,12 @@ export function WorkspaceChat({
     const contextManager = contextManagerRef.current
 
     if (parsed.command === "context") {
+      await contextManager.loadGuidanceFiles({
+        files: guidanceFiles,
+        workspacePath,
+        task: "show loaded context",
+        selectedFile,
+      })
       const stats = contextManager.getStats(modelContextLength)
       const loadedFiles = contextManager.getLoadedFiles()
 

@@ -14,6 +14,10 @@ import { WorkspacePatchPanel } from "./WorkspacePatchPanel"
 import { writeWorkspaceFile } from "./workspaceApi"
 import { applyPatchMatch } from "./patchMatcher"
 import type { PatchMatchResult } from "./patchMatcher"
+import { scanWorkspaceTree } from "./workspaceScanner"
+import type { GuidanceDraft, WorkspaceScanReport } from "./workspaceScanner"
+import ollama from "ollama/browser"
+import { useSelectedModel } from "@/hooks/useSelectedModel"
 
 import type { WorkspaceNode } from "@/types/workspace-webview"
 import {
@@ -73,6 +77,21 @@ function findGuidance(node: WorkspaceNode): WorkspaceNode[] {
   })
 
   return results
+}
+
+function extractJsonObject(value: string) {
+  const start = value.indexOf("{")
+  const end = value.lastIndexOf("}")
+
+  if (start === -1 || end === -1 || end <= start) {
+    return null
+  }
+
+  try {
+    return JSON.parse(value.slice(start, end + 1))
+  } catch {
+    return null
+  }
 }
 
 function normalizeWorkspacePath(path: string) {
@@ -187,6 +206,19 @@ export default function WorkspacePage() {
   const [rightWidth, setRightWidth] = useState(480)
   const [patchHeight, setPatchHeight] = useState(360)
 
+  const [scanReport, setScanReport] = useState<WorkspaceScanReport | null>(null)
+  const [showScanPanel, setShowScanPanel] = useState(() => {
+    return localStorage.getItem("show_scan_panel") !== "false"
+  })
+
+  useEffect(() => {
+    localStorage.setItem("show_scan_panel", String(showScanPanel))
+  }, [showScanPanel])
+
+  const { selectedModel } = useSelectedModel()
+  const [guidanceDraft, setGuidanceDraft] = useState<GuidanceDraft | null>(null)
+  const [isGeneratingGuidance, setIsGeneratingGuidance] = useState(false)
+
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceNode | null>(null)
   const [workspaceMap, setWorkspaceMap] = useState("")
@@ -207,6 +239,8 @@ export default function WorkspacePage() {
   }
 
   const loadWorkspaceFromPath = async (path: string) => {
+    setScanReport(null)
+    setGuidanceDraft(null)
     setWorkspaceError(null)
     setSelectedFile(null)
     setSelectedFileContent("")
@@ -236,6 +270,7 @@ export default function WorkspacePage() {
     }
 
     setWorkspaceTree(treeResponse.root)
+    setScanReport(scanWorkspaceTree(treeResponse.root))
     
     const detectedGuidance = findGuidance(treeResponse.root)
 
@@ -448,6 +483,165 @@ export default function WorkspacePage() {
     setTimeout(() => setWorkspaceNotice(null), 2500)
   }
 
+  const handleGenerateGuidanceDraft = async () => {
+    const report = scanReport || scanWorkspaceTree(workspaceTree)
+
+    if (!report) {
+      setWorkspaceError("Scan workspace first before generating guidance.")
+      return
+    }
+
+    setScanReport(report)
+    setGuidanceDraft(null)
+    setWorkspaceError(null)
+    setWorkspaceNotice("Generating guidance draft...")
+    setIsGeneratingGuidance(true)
+
+    try {
+      const prompt = `You are generating guidance files for a local workspace-aware coding agent.
+
+  The app has already scanned the workspace. Do not invent files that are not supported by the scan report.
+
+  SCAN REPORT:
+  ${JSON.stringify(report, null, 2)}
+
+  Generate guidance files that make this project agent-ready.
+
+  Return ONLY valid JSON with this exact shape:
+
+  {
+    "type": "guidance_draft",
+    "files": [
+      {
+        "path": "START_HERE.md",
+        "content": "markdown content"
+      }
+    ],
+    "questions": [
+      "optional question for the user"
+    ]
+  }
+
+  Required files:
+  - START_HERE.md
+  - rules.md
+  - AGENTS.md
+
+  For this first draft, generate ONLY:
+  - START_HERE.md
+  - rules.md
+  - AGENTS.md
+  - backend/context.md if backend exists
+  - frontend/context.md if frontend exists
+  - docs/context.md if docs exists
+
+  Keep each file concise.
+
+  Rules:
+  - Use paths relative to workspace root.
+  - Do not overwrite project code files.
+  - Do not include markdown fences around the JSON.
+  - Keep guidance practical and project-specific.
+  - Mention runtime/generated folders that should usually not be edited.
+  - Mention source, frontend, backend, docs, data, config, and tests only if present in the scan.
+  `
+
+      const result = await ollama.generate({
+        model: selectedModel?.model || "qwen3.5:9b",
+        prompt,
+        stream: false,
+        think: false,
+        format: "json",
+        options: {
+          temperature: 0.1,
+          num_predict: 8192,
+        },
+      })
+
+      const parsed = extractJsonObject(result.response) as GuidanceDraft | null
+
+      if (
+        !parsed ||
+        parsed.type !== "guidance_draft" ||
+        !Array.isArray(parsed.files)
+      ) {
+        setWorkspaceError(
+            `Guidance draft response was invalid or incomplete.
+
+          Chars returned: ${result.response.length}
+
+          First 500 chars:
+          ${result.response.slice(0, 500)}
+
+          Last 500 chars:
+          ${result.response.slice(-500)}`,
+          )
+        return
+      }
+
+      setGuidanceDraft(parsed)
+      setWorkspaceNotice("Guidance draft generated. Review before saving.")
+      setShowScanPanel(false)
+    } catch (err) {
+      setWorkspaceError(
+        err instanceof Error ? err.message : "Failed to generate guidance draft",
+      )
+    } finally {
+      setIsGeneratingGuidance(false)
+      setTimeout(() => setWorkspaceNotice(null), 2500)
+    }
+  }
+
+  const handleSaveGuidanceDraft = async () => {
+    if (!guidanceDraft || !workspacePath) {
+      setWorkspaceError("No guidance draft available to save.")
+      return
+    }
+
+    setWorkspaceError(null)
+    setWorkspaceNotice("Saving guidance files...")
+
+    for (const file of guidanceDraft.files) {
+      const safeRelPath = normalizeWorkspacePath(file.path)
+      const targetPath = resolveWorkspacePath(safeRelPath, workspacePath)
+
+      const existing = await readWorkspaceFile(targetPath)
+
+      if (existing.ok) {
+        setWorkspaceError(
+          `Guidance file already exists: ${file.path}. Overwrite support will be added later.`,
+        )
+        setWorkspaceNotice(null)
+        return
+      }
+
+      const isMissingFile =
+        existing.error?.toLowerCase().includes("cannot find the file") ||
+        existing.error?.toLowerCase().includes("no such file") ||
+        existing.error?.toLowerCase().includes("not found")
+
+      if (!isMissingFile) {
+        setWorkspaceError(existing.error || `Could not check ${file.path}`)
+        setWorkspaceNotice(null)
+        return
+      }
+
+      const writeResult = await writeWorkspaceFile(targetPath, file.content)
+
+      if (!writeResult.ok) {
+        setWorkspaceError(writeResult.error || `Failed to write ${file.path}`)
+        setWorkspaceNotice(null)
+        return
+      }
+    }
+
+    await reloadWorkspaceTree()
+    setContextRevision((prev) => prev + 1)
+    setGuidanceDraft(null)
+    setWorkspaceNotice("Guidance files saved.")
+    setTimeout(() => setWorkspaceNotice(null), 2500)
+  }
+
   const startPatchResize = (event: React.MouseEvent<HTMLDivElement>) => {
     const startY = event.clientY
     const startHeight = patchHeight
@@ -513,6 +707,7 @@ export default function WorkspacePage() {
     }
 
     setWorkspaceTree(treeResponse.root)
+    setScanReport(scanWorkspaceTree(treeResponse.root))
 
     const detectedGuidance = findGuidance(treeResponse.root)
 
@@ -616,6 +811,32 @@ useEffect(() => {
                 </button>
               ))
             )}
+
+            <button
+              type="button"
+              onClick={() => {
+                setScanReport(scanWorkspaceTree(workspaceTree))
+                setShowScanPanel(true)
+              }}
+              className="rounded bg-neutral-100 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-200 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700"
+            >
+              Scan workspace
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowScanPanel((prev) => !prev)}
+              className="rounded bg-neutral-100 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-200 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700"
+            >
+              {showScanPanel ? "Hide report" : "Show report"}
+            </button>
+            <button
+              type="button"
+              disabled={!scanReport || isGeneratingGuidance}
+              onClick={handleGenerateGuidanceDraft}
+              className="rounded bg-neutral-100 px-2 py-1 text-xs text-neutral-700 hover:bg-neutral-200 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-neutral-800 dark:text-neutral-200 dark:hover:bg-neutral-700"
+            >
+              {isGeneratingGuidance ? "Generating..." : "Generate guidance draft"}
+            </button>
           </div>
         </header>
           {workspaceNotice && (
@@ -629,6 +850,124 @@ useEffect(() => {
               {workspaceError}
             </div>
           )}
+        {scanReport && showScanPanel && (
+          <div className="border-b border-neutral-200 bg-neutral-50 px-4 py-3 text-xs text-neutral-700 dark:border-neutral-800 dark:bg-neutral-950 dark:text-neutral-300">
+            <div className="mb-2 font-medium">Workspace scan</div>
+
+            <div className="grid grid-cols-4 gap-3">
+              <div>
+                <div className="text-neutral-500">Files</div>
+                <div className="font-mono">{scanReport.fileCount}</div>
+              </div>
+
+              <div>
+                <div className="text-neutral-500">Folders</div>
+                <div className="font-mono">{scanReport.folderCount}</div>
+              </div>
+
+              <div>
+                <div className="text-neutral-500">Top languages</div>
+                <div className="font-mono">
+                  {Object.entries(scanReport.languages)
+                    .sort((a, b) => b[1] - a[1])
+                    .slice(0, 4)
+                    .map(([ext, count]) => `${ext}:${count}`)
+                    .join(" ")}
+                </div>
+              </div>
+
+              <div>
+                <div className="text-neutral-500">Guidance</div>
+                <div className="font-mono">
+                  {[
+                    scanReport.existingGuidance.startHere && "START",
+                    scanReport.existingGuidance.agents && "AGENTS",
+                    scanReport.existingGuidance.rules && "RULES",
+                    scanReport.existingGuidance.contextFiles.length &&
+                      `${scanReport.existingGuidance.contextFiles.length} ctx`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ") || "none"}
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-3">
+              <div className="text-neutral-500">Likely entry points</div>
+              <div className="mt-1 font-mono">
+                {scanReport.likelyEntryPoints.length
+                  ? scanReport.likelyEntryPoints.join(", ")
+                  : "none detected"}
+              </div>
+            </div>
+
+            <div className="mt-3">
+              <div className="text-neutral-500">Main folders</div>
+              <div className="mt-1 flex flex-wrap gap-1">
+                {scanReport.folders.slice(0, 10).map((folder) => (
+                  <span
+                    key={folder.path}
+                    className="rounded bg-neutral-200 px-2 py-0.5 font-mono dark:bg-neutral-800"
+                  >
+                    {folder.path} · {folder.likelyRole} · {folder.fileCount}
+                  </span>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {guidanceDraft && (
+          <div className="max-h-[45vh] overflow-auto border-b border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-900 dark:border-blue-900/50 dark:bg-blue-900/20 dark:text-blue-200">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="font-medium">Guidance draft preview</div>
+
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setGuidanceDraft(null)}
+                  className="rounded bg-white px-2 py-1 text-xs text-blue-900 hover:bg-blue-100 dark:bg-neutral-950 dark:text-blue-200 dark:hover:bg-neutral-900"
+                >
+                  Clear draft
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleSaveGuidanceDraft}
+                  className="rounded bg-blue-700 px-2 py-1 text-xs text-white hover:bg-blue-800"
+                >
+                  Save guidance files
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              {guidanceDraft.files.map((file) => (
+                <div
+                  key={file.path}
+                  className="rounded-lg border border-blue-200 bg-white p-3 dark:border-blue-800 dark:bg-neutral-950"
+                >
+                  <div className="mb-2 font-mono font-medium">{file.path}</div>
+                  <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-neutral-100 p-3 font-mono text-xs dark:bg-neutral-900">
+                    {file.content}
+                  </pre>
+                </div>
+              ))}
+            </div>
+
+            {guidanceDraft.questions && guidanceDraft.questions.length > 0 && (
+              <div className="mt-3 rounded-lg bg-white p-3 dark:bg-neutral-950">
+                <div className="font-medium">Questions</div>
+                <ul className="mt-1 list-disc pl-5">
+                  {guidanceDraft.questions.map((question, index) => (
+                    <li key={index}>{question}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+
         <div
           className="min-h-0 flex-1 grid overflow-hidden"
           style={{
