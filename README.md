@@ -14,6 +14,8 @@ This fork extends the original Ollama app with a **local-first, workspace-aware 
 ![Workspace UI POC](workspace-ui-poc/workspace_ui_patch_edit.png)  
 ![Workspace UI POC](workspace-ui-poc/workspace_ui_patch_create.png)  
 ![Workspace UI POC](workspace-ui-poc/workspace_ui_ctx.png)
+![Workspace UI POC](workspace-ui-poc/workspace_ui_scan_workspace_report.png)
+![Workspace UI POC](workspace-ui-poc/workspace_ui_generate_guidance_draft.png)
 
 ---
 
