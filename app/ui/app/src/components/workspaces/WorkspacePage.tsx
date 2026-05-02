@@ -18,6 +18,7 @@ import { scanWorkspaceTree } from "./workspaceScanner"
 import type { GuidanceDraft, WorkspaceScanReport } from "./workspaceScanner"
 import ollama from "ollama/browser"
 import { useSelectedModel } from "@/hooks/useSelectedModel"
+import {validateGuidanceDraft,  type GuidanceDraftValidation, } from "./guidanceDraftValidator"
 
 import type { WorkspaceNode } from "@/types/workspace-webview"
 import {
@@ -218,6 +219,7 @@ export default function WorkspacePage() {
   const { selectedModel } = useSelectedModel()
   const [guidanceDraft, setGuidanceDraft] = useState<GuidanceDraft | null>(null)
   const [isGeneratingGuidance, setIsGeneratingGuidance] = useState(false)
+  const [guidanceValidation, setGuidanceValidation] = useState<GuidanceDraftValidation | null>(null)
 
   const [workspacePath, setWorkspacePath] = useState<string | null>(null)
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceNode | null>(null)
@@ -249,6 +251,7 @@ export default function WorkspacePage() {
     setAllGuidanceFiles([])
     setPatchProposal(null)
     setPatchMatchResults({})
+    setGuidanceValidation(null)
 
     const rootResult = await setWorkspaceRoot(path)
 
@@ -538,12 +541,44 @@ export default function WorkspacePage() {
   Keep each file concise.
 
   Rules:
-  - Use paths relative to workspace root.
-  - Do not overwrite project code files.
-  - Do not include markdown fences around the JSON.
-  - Keep guidance practical and project-specific.
-  - Mention runtime/generated folders that should usually not be edited.
-  - Mention source, frontend, backend, docs, data, config, and tests only if present in the scan.
+    Guidance quality rules:
+  - Avoid contradictions.
+  - Do not say all guidance files are root-level if folder context.md files are generated.
+  - Runtime folders must be marked as normally off-limits.
+  - Data folders are not always runtime. If unclear, say "ask before editing data files unless explicitly instructed."
+  - Unknown folders must NOT be described as runtime-generated. Say "ask before editing unknown folders."
+  - Do not claim empty folders are used for a specific purpose unless the scan proves it.
+  - Mention likely entry points exactly as listed in the scan report.
+  - Keep each file concise but specific.
+
+  START_HERE.md must include:
+  - Project Purpose
+  - Workspace Layout
+    - Give reletaive paths in full to each file. example: src/backend/main.py 
+  - Entry Points
+  - Guidance Chain
+  - Runtime / Data Safety
+  - Agent Navigation Rules
+
+  rules.md must include:
+  - safe edit rules
+  - command behavior rules
+  - patch rules
+  - runtime/generated folder rules
+  - data/unknown folder caution
+
+  AGENTS.md must include:
+  - agent role
+  - workflow
+  - constraints
+  - when to ask for context
+  - where to place docs/source changes
+
+  Folder context.md files must include:
+  - folder purpose
+  - important files if known
+  - edit rules
+  - relationship to other folders
   `
 
       const result = await ollama.generate({
@@ -578,9 +613,11 @@ export default function WorkspacePage() {
           )
         return
       }
-
+      
+      const validation = validateGuidanceDraft(parsed, report)
       setGuidanceDraft(parsed)
-      setWorkspaceNotice("Guidance draft generated. Review before saving.")
+      setGuidanceValidation(validation)
+      setWorkspaceNotice(validation.ok ? "Guidance draft generated. Review before saving." : "Guidance draft generated with validation errors.",)
       setShowScanPanel(false)
     } catch (err) {
       setWorkspaceError(
@@ -595,6 +632,15 @@ export default function WorkspacePage() {
   const handleSaveGuidanceDraft = async () => {
     if (!guidanceDraft || !workspacePath) {
       setWorkspaceError("No guidance draft available to save.")
+      return
+    }
+
+    const validation = validateGuidanceDraft(guidanceDraft, scanReport)
+
+    setGuidanceValidation(validation)
+
+    if (!validation.ok) {
+      setWorkspaceError("Guidance draft has validation errors. Fix or regenerate before saving.")
       return
     }
 
@@ -933,14 +979,39 @@ useEffect(() => {
 
                 <button
                   type="button"
+                  disabled={guidanceValidation?.errors.length ? true : false}
                   onClick={handleSaveGuidanceDraft}
-                  className="rounded bg-blue-700 px-2 py-1 text-xs text-white hover:bg-blue-800"
+                  className="rounded bg-blue-700 px-2 py-1 text-xs text-white hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   Save guidance files
                 </button>
               </div>
             </div>
+            {guidanceValidation && (
+                  <div className="mb-3 space-y-2">
+                    {guidanceValidation.errors.length > 0 && (
+                      <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-red-800 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-200">
+                        <div className="font-medium">Validation errors</div>
+                        <ul className="mt-1 list-disc pl-5">
+                          {guidanceValidation.errors.map((error, index) => (
+                            <li key={index}>{error}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
 
+                    {guidanceValidation.warnings.length > 0 && (
+                      <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-amber-800 dark:border-amber-900/50 dark:bg-amber-900/20 dark:text-amber-200">
+                        <div className="font-medium">Validation warnings</div>
+                        <ul className="mt-1 list-disc pl-5">
+                          {guidanceValidation.warnings.map((warning, index) => (
+                            <li key={index}>{warning}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                )}
             <div className="space-y-3">
               {guidanceDraft.files.map((file) => (
                 <div
